@@ -1,4 +1,6 @@
-# plotter-web-app
+# プロッタ千里ちゃん
+
+**Plotter Senri-chan** — a pen plotter studio in your browser
 
 ブラウザだけで動く、ペンプロッタ用の作図・描画アプリです。
 カメラで撮った写真を線画の似顔絵にしたり、QRコード・文字・アイコン・SVG・G-code を組み合わせたりして、そのまま grblHAL のプロッタへ送って描けます。
