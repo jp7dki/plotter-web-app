@@ -112,8 +112,8 @@
   table.cmp th{font-size:11px;color:var(--sub);font-weight:600}
   table.cmp .sel{font-weight:700;color:var(--ink);background:var(--acc-soft)}
   table.cmp td.better{color:var(--ok);font-weight:600} table.cmp td.worse{color:var(--warn);font-weight:600}
-  .addBar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px}
-  .addBar button{flex-direction:column;justify-content:center;gap:1px;padding:6px 0;font-size:11px;border-radius:9px}
+  .addBar{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+  .addBar button{flex-direction:column;justify-content:center;gap:1px;padding:6px 0;font-size:10px;white-space:nowrap;min-width:0;border-radius:9px}
   .addBar button i{font-style:normal;font-size:17px;line-height:1.1}
   .addBar button:hover{background:var(--acc-soft);border-color:#c8d5f7}
   .addBar button.on{background:var(--acc-soft);border-color:var(--acc);color:var(--acc)}
@@ -148,6 +148,7 @@
       <div class="addBar" id="addBar">
         <button data-add="portrait" title="写真から似顔絵を作る"><i>📷</i>似顔絵</button>
         <button data-add="qr" title="QRコードを追加"><i>▦</i>QR</button>
+        <button data-add="draw" title="手書きで絵を描く"><i>✎</i>手書き</button>
         <button data-add="text" title="文字を追加"><i>Ａ</i>文字</button>
         <button data-add="icon" title="ハート・星などのアイコンを追加"><i>★</i>アイコン</button>
         <button data-add="svg" title="SVG ファイルを読み込む"><i>📄</i>SVG</button>
@@ -327,6 +328,26 @@
         <label class="chk hidden"><input type="checkbox" id="qrPortrait" checked>似顔絵も一緒に描く</label>
         <div class="btns"><button id="qrTest">読み取りテスト</button></div>
         <div class="note" id="qrInfo" style="white-space:pre-line">QRコードの生成も端末内で行います。内容は保存しません。</div>
+      </div>
+    </section>
+
+    <!-- 手書き -->
+    <section class="panel" data-panel="draw" hidden>
+      <div class="card">
+        <h2>手書き <small>プレビューの紙に直接描けます</small></h2>
+        <div class="toggle" id="drTools" style="display:flex">
+          <button data-tool="pen" class="on" style="flex:1;justify-content:center">ペン</button>
+          <button data-tool="erase" style="flex:1;justify-content:center">消しゴム</button>
+          <button data-tool="move" style="flex:1;justify-content:center">移動・拡大</button>
+        </div>
+        <div class="fld" style="margin-top:8px"><span>手ぶれ補正：<b id="drSmoothV">2</b></span><input type="range" id="drSmooth" min="0" max="5" step="1" value="2" style="padding:0;accent-color:var(--acc)"></div>
+        <label class="chk"><input type="checkbox" id="drStraight">直線で描く（Shift を押しながらでも）</label>
+        <div class="btns" style="margin-top:4px">
+          <button id="drUndo" disabled>元に戻す</button>
+          <button id="drRedo" disabled>やり直す</button>
+          <button id="drClear" class="danger" disabled>全部消す</button>
+        </div>
+        <div class="note" id="drInfo"></div>
       </div>
     </section>
 
@@ -1559,9 +1580,10 @@ const hasLayer=k=>layers.some(l=>l.key===k);
 function syncLayers(){
   if(result&&!hasLayer('portrait')) layers.unshift({key:'portrait',visible:true});
   if($('qrOn').checked&&!hasLayer('qr')) layers.push({key:'qr',visible:true});
+  for(const d of drawings) if(!hasLayer('draw:'+d.id)) layers.push({key:'draw:'+d.id,visible:true});
   for(const f of files) if(!hasLayer('file:'+f.fid)) layers.push({key:'file:'+f.fid,visible:true});
   for(const st of stamps) if(!hasLayer('stamp:'+st.id)) layers.push({key:'stamp:'+st.id,visible:true});
-  layers=layers.filter(l=>l.key==='portrait'?!!result:l.key==='qr'?$('qrOn').checked:l.key.startsWith('file:')?!!fileOf(l.key):!!stampOf(l.key));
+  layers=layers.filter(l=>l.key==='portrait'?!!result:l.key==='qr'?$('qrOn').checked:l.key.startsWith('file:')?!!fileOf(l.key):l.key.startsWith('draw:')?!!drawOf(l.key):!!stampOf(l.key));
 }
 // すべてのエレメントを重なり順に合成して、実際に描く線を作る
 function compose(){
@@ -1576,6 +1598,8 @@ function compose(){
       const pp=portraitXf(result['paths']); if(pp.length){ P=P.concat(pp); activeObjs.portrait=true; parts.push('似顔絵'); }
     } else if(L.key==='qr'){
       const q=buildQR(); if(q){ P=clipOut(P,q.clearRect).concat(q.paths); activeObjs.qr=true; parts.push('QRコード'); }
+    } else if(L.key.startsWith('draw:')){
+      const d=drawOf(L.key); if(d&&d.strokes.length){ P=P.concat(orderPaths(d.strokes)); activeObjs[L.key]=true; parts.push('手書き'); }
     } else if(L.key.startsWith('file:')){
       const f=fileOf(L.key); if(!f) continue;
       const fp=f.kind==='svg'?svgPlaced(f):importedPaths(f);
@@ -1873,7 +1897,7 @@ function draw(){
   x.fillStyle='#fff'; x.shadowColor='rgba(0,0,0,.15)'; x.shadowBlur=10; x.fillRect(ox,oy,A.pw*sc,A.ph*sc); x.shadowBlur=0;
   x.strokeStyle='#ddd'; x.setLineDash([4,4]); x.strokeRect(ox+A.m*sc,oy+A.m*sc,A.aw*sc,A.ah*sc); x.setLineDash([]);
   viewMap={sc, bx:ox+A.m*sc, by:oy+A.m*sc};
-  if(!result&&!finalPaths.length){x.fillStyle="#999";x.font='16px sans-serif';x.textAlign='center';x.fillText('撮影・QRコード・ファイル読込で描画内容を作ると、ここに表示されます',cv.width/2,cv.height/2);return;}
+  if(!result&&!finalPaths.length&&!liveStroke){x.fillStyle="#999";x.font='16px sans-serif';x.textAlign='center';x.fillText('撮影・QRコード・ファイル読込で描画内容を作ると、ここに表示されます',cv.width/2,cv.height/2);return;}
   const bx=ox+A.m*sc, by=oy+A.m*sc;
   if(view==='src'){
     if(!result||!result.img){x.fillStyle='#999';x.font='16px sans-serif';x.textAlign='center';x.fillText('写真は破棄済みです',cv.width/2,cv.height/2);return;}
@@ -1897,6 +1921,7 @@ function draw(){
     x.stroke();
   }
   drawLayoutOverlay(x,bx,by,sc);
+  drawLiveStroke(x,bx,by,sc);
 }
 function updateStats(){
   if(!finalPaths.length){$("stats").textContent="";return;}
@@ -2697,6 +2722,7 @@ function layoutObjects(){
     const L=layers[i]; if(!L.visible) continue;
     if(L.key==='portrait'&&activeObjs.portrait) o.push({id:'portrait',box:portraitBox()});
     else if(L.key==='qr'&&activeObjs.qr&&lastPlaced.qr) o.push({id:'qr',box:{...lastPlaced.qr}});
+    else if(L.key.startsWith('draw:')&&activeObjs[L.key]){ const d=drawOf(L.key); if(d) o.push({id:L.key,box:drawBox(d)}); }
     else if(L.key.startsWith('file:')&&activeObjs[L.key]){
       const f=fileOf(L.key), p=f&&(f.kind==='svg'?f.placed:f.box); if(p) o.push({id:L.key,box:{x0:p.x0,y0:p.y0,w:p.w,h:p.h}});
     }
@@ -2722,6 +2748,13 @@ function applyBox(d,b){
       Object.assign(f.opts,{place:'xy',scale:+(s*100).toFixed(3),x:+X.toFixed(2),y:+Y.toFixed(2)});
       if(f===imported) loadFileFields(f);
     } else if(f) f.t={s:d.gcT0.s*b.w/d.b0.w, x0:b.x0, y0:b.y0};
+  } else if(d.id.startsWith('draw:')){
+    const dr=drawOf(d.id);
+    if(dr){
+      if(!d.base){ d.base=copyStrokes(dr.strokes); pushUndo(dr); }   // 動かす前の形を基準にする（誤差を溜めない）
+      const k=b.w/d.b0.w; dr.strokes=d.base.map(s=>s.map(([x,y])=>[b.x0+(x-d.b0.x0)*k, b.y0+(y-d.b0.y0)*k]));
+      syncDrawPanel();
+    }
   } else if(d.id.startsWith('stamp:')){
     const st=stampOf(d.id); if(st){ st.x0=b.x0; st.y0=b.y0; st.w=b.w; st.h=b.h; syncStampPanel(); }
   }
@@ -2750,7 +2783,7 @@ function movable(id){
   return true;
 }
 function drawLayoutOverlay(x,bx,by,sc){
-  if(view!=='plot') return;
+  if(view!=='plot'||drawActive()) return;   // 手書き中は枠を出さない
   const k=cssScale(), hs=9/k;
   for(const o of layoutObjects()){
     const sel=layoutSel===o.id, hov=layoutHover===o.id; if(!sel&&!hov) continue;
@@ -2826,7 +2859,7 @@ function drawLayoutOverlay(x,bx,by,sc){
 // プレビュー上の選択 ID もレイヤーのキーと同じ（'portrait' 'qr' 'file:N' 'stamp:N'）
 var editorMode=null;
 const idToKey=id=>id, keyToId=key=>key;
-function objLabel(id){ if(OBJ_LABEL[id]) return OBJ_LABEL[id]; const f=fileOf(id); if(f) return `${f.kind==='svg'?'SVG':'G-code'}「${f.name}」`; return stampName(stampOf(id)); }
+function objLabel(id){ if(OBJ_LABEL[id]) return OBJ_LABEL[id]; if(drawOf(id)) return '手書き'; const f=fileOf(id); if(f) return `${f.kind==='svg'?'SVG':'G-code'}「${f.name}」`; return stampName(stampOf(id)); }
 function gcT0For(id,box){ const f=fileOf(id); return f&&f.kind==='gcode'?(f.t||{s:1,x0:box.x0,y0:box.y0}):null; }
 // 「ファイルのまま送信」の G-code は他と混ぜられないので、一番前面にある1つだけを描く
 function rawFile(){
@@ -2838,6 +2871,7 @@ function modeFor(id){
   if(id==='portrait') return 'portrait';
   if(id==='qr') return 'qr';
   if(fileOf(id)) return 'file';
+  if(drawOf(id)) return 'draw';
   const st=stampOf(id); return st?(st.type==='text'?'text':'stamp'):null;
 }
 // 左側に出す設定欄を切り替える
@@ -2849,12 +2883,14 @@ function showEditor(mode){
   panel('qr').hidden=mode!=='qr';
   panel('file').hidden=mode!=='file';
   panel('deco').hidden=!deco;
+  panel('draw').hidden=mode!=='draw';
+  if(mode==='draw') syncDrawPanel(); else $('preview').style.cursor='';
   $('decoIcons').classList.toggle('hidden',mode!=='icon-add');
   $('decoText').classList.toggle('hidden',!(mode==='text-add'||mode==='text'));
   $('decoProps').classList.toggle('hidden',!(mode==='stamp'||mode==='text'));
   $('txAdd').closest('.btns').classList.toggle('hidden',mode==='text');
   $('elEmpty').classList.toggle('hidden',!!mode);
-  const on={portrait:'portrait',qr:'qr','icon-add':'icon','text-add':'text'}[mode];
+  const on={draw:'draw',portrait:'portrait',qr:'qr','icon-add':'icon','text-add':'text'}[mode];
   document.querySelectorAll('#addBar button').forEach(b=>b.classList.toggle('on',b.dataset.add===on));
 }
 function selectElement(id){
@@ -2866,6 +2902,7 @@ function rawExclusiveActive(){ return !!rawFile(); }
 function layerInfo(key){
   if(key==='portrait') return {ic:'📷',name:'似顔絵',sub:srcCanvas?'写真あり（線画を調整できます）':'線画のみ（写真は破棄済み）'};
   if(key==='qr'){ const t=$('qrText').value.trim(); return {ic:'▦',name:'QRコード',sub:t||'内容を入力してください'}; }
+  if(key.startsWith('draw:')){ const d=drawOf(key); if(d) return {ic:'✎',name:'手書き',sub:d.strokes.length?`線 ${d.strokes.length} 本`:'まだ何も描いていません'}; }
   if(key.startsWith('file:')){ const f=fileOf(key); if(f) return {ic:f.kind==='svg'?'📄':'⚙',name:f.kind==='svg'?'SVG':'G-code',sub:f.name+(f.kind==='gcode'&&f.opts.mode==='raw'?'（ファイルのまま送信）':'')}; }
   const st=stampOf(key);
   if(st) return st.type==='text'?{ic:'Ａ',name:'文字',sub:st.text.replace(/\n/g,' / ')}:{ic:'★',name:ICONS[st.type].name,sub:`${Math.round(Math.max(st.w,st.h))}mm`+(st.fill!=='none'?'・塗り':'')+(st.rot?`・${st.rot}°`:'')};
@@ -2889,6 +2926,7 @@ function renderLayers(){
     mk('↑','前面へ（1つ上）',()=>moveLayer(i,+1),i===layers.length-1);
     mk('↓','背面へ（1つ下）',()=>moveLayer(i,-1),i===0);
     if(L.key.startsWith('stamp:')) mk('⧉','複製',()=>dupStamp(L.key));
+    if(L.key.startsWith('draw:')) mk('⧉','複製',()=>dupDrawing(L.key));
     mk('🗑','削除',()=>deleteElement(keyToId(L.key)));
     row.append(vis,ic,nm,ops);
     row.onclick=()=>selectElement(keyToId(L.key));
@@ -2911,6 +2949,7 @@ function deleteElement(id){
   if(!id) return; const key=idToKey(id);
   if(key==='portrait'){ if(!confirm('似顔絵を削除しますか？（写真も破棄します）')) return; result=null; discardPhoto(); }
   else if(key==='qr') $('qrOn').checked=false;
+  else if(key.startsWith('draw:')) drawings=drawings.filter(x=>'draw:'+x.id!==key);
   else if(key.startsWith('file:')){
     files=files.filter(x=>'file:'+x.fid!==key);
     if(imported&&'file:'+imported.fid===key){ imported=files[files.length-1]||null; if(imported) loadFileFields(imported); }
@@ -2931,6 +2970,7 @@ document.querySelectorAll('#addBar button').forEach(b=>b.addEventListener('click
     const sel=stampOf(layoutSel); if(!(sel&&sel.type==='bubble')) layoutSel=null;
     $('txText').value=''; syncStampPanel(); renderLayers(); updateCommon(); draw(); showEditor('text-add'); $('txText').focus();
   }
+  else if(k==='draw') addDrawing();
   else if(k==='icon'){ layoutSel=null; syncStampPanel(); renderLayers(); updateCommon(); draw(); showEditor('icon-add'); }
   else if(k==='svg') $('svgFile').click();
   else if(k==='gcode') $('gcFile').click();
@@ -2965,6 +3005,139 @@ const elLater=fn=>{ clearTimeout(elTimer); elTimer=setTimeout(fn,250); };
 })));
 $('elCenter').onclick=()=>{ const b=selBox(); if(!b) return; const A=drawArea(); setSelBox({x0:(A.aw-b.w)/2,y0:(A.ah-b.h)/2,w:b.w,h:b.h}); };
 $('elFitArea').onclick=()=>{ const b=selBox(); if(!b) return; const A=drawArea(), s=Math.min(A.aw/b.w,A.ah/b.h), w=b.w*s, h=b.h*s; setSelBox({x0:(A.aw-w)/2,y0:(A.ah-h)/2,w,h}); };
+
+/* ========== 手書き：プレビューの紙の上に直接描く ========== */
+// 1つの手書きエレメント = {id, strokes:[[ [x,y],… ],…], undo:[], redo:[]}（座標は描画範囲内の mm）
+var drawings=[], drawSeq=1, drawTool='pen', liveStroke=null, erasing=null;
+const drawOf=id=>(typeof id==='string'&&id.startsWith('draw:'))?(drawings.find(d=>'draw:'+d.id===id)||null):null;
+const copyStrokes=s=>s.map(p=>p.map(q=>[q[0],q[1]]));
+function pushUndo(d){ d.undo.push(copyStrokes(d.strokes)); if(d.undo.length>100) d.undo.shift(); d.redo=[]; }
+function drawBox(d){
+  const b=bboxOf(d.strokes);
+  // 点や真っすぐな線でも選べるよう、最小の大きさを持たせる
+  const w=Math.max(b.w,1), h=Math.max(b.h,1);
+  return {x0:b.x0-(w-b.w)/2, y0:b.y0-(h-b.h)/2, w, h};
+}
+function drawActive(){ return editorMode==='draw'&&drawTool!=='move'&&view==='plot'&&!plotState.running ? drawOf(layoutSel) : null; }
+function addDrawing(){
+  const d={id:drawSeq++,strokes:[],undo:[],redo:[]};
+  drawings.push(d); setDrawTool('pen'); compose(); selectElement('draw:'+d.id);
+}
+function setDrawTool(t){
+  drawTool=t; liveStroke=null;
+  document.querySelectorAll('#drTools button').forEach(b=>b.classList.toggle('on',b.dataset.tool===t));
+  $('preview').style.cursor='';
+  syncDrawPanel(); draw();
+}
+function syncDrawPanel(){
+  const d=drawOf(layoutSel);
+  $('drUndo').disabled=!d||!d.undo.length; $('drRedo').disabled=!d||!d.redo.length; $('drClear').disabled=!d||!d.strokes.length;
+  const how={pen:'紙の上をドラッグすると線が描けます。Shift を押しながらだと直線になります。',
+    erase:'消したい線をなぞると、線を1本ずつ消せます。',
+    move:'ドラッグで移動、四隅の■やホイールで拡大縮小できます。'}[drawTool];
+  $('drInfo').textContent=(d?`線 ${d.strokes.length} 本。`:'')+how;
+}
+// 描いた線の手ぶれを整える（0＝そのまま）
+function tidyStroke(pts,level){
+  if(pts.length<3||level<=0) return pts;
+  let p=rdp(pts,0.08*level);
+  return p.length>2?rdp(chaikin(p,2),0.03):p;
+}
+function eraseAt(d,p){
+  const r=Math.max(p.tol,0.8), near=s=>{
+    if(s.length===1) return Math.hypot(s[0][0]-p.x,s[0][1]-p.y)<=r;
+    for(let i=1;i<s.length;i++){
+      const [ax,ay]=s[i-1],[bx,by]=s[i],dx=bx-ax,dy=by-ay,L=dx*dx+dy*dy;
+      const t=L?Math.max(0,Math.min(1,((p.x-ax)*dx+(p.y-ay)*dy)/L)):0;
+      if(Math.hypot(p.x-ax-t*dx,p.y-ay-t*dy)<=r) return true;
+    }
+    return false;
+  };
+  const keep=d.strokes.filter(s=>!near(s));
+  if(keep.length===d.strokes.length) return;
+  if(!erasing.pushed){ pushUndo(d); erasing.pushed=true; }   // ひとなぞりで1回分の「元に戻す」
+  d.strokes=keep; compose(); syncDrawPanel();
+}
+function commitStroke(){
+  const s=liveStroke; liveStroke=null; if(!s) return;
+  let pts=s.pts;
+  if(pts.length===1) pts=[pts[0],[pts[0][0]+0.05,pts[0][1]]];   // 点を打つ
+  if(!s.straight) pts=tidyStroke(pts,+$('drSmooth').value);
+  pushUndo(s.d); s.d.strokes.push(pts);
+  compose(); syncDrawPanel();
+}
+function drawUndo(redo){
+  const d=drawOf(layoutSel); if(!d||liveStroke) return;
+  const from=redo?d.redo:d.undo, to=redo?d.undo:d.redo; if(!from.length) return;
+  to.push(copyStrokes(d.strokes)); d.strokes=from.pop(); compose(); syncDrawPanel();
+}
+// 描いている途中の線をプレビューに重ねて表示
+function drawLiveStroke(x,bx,by,sc){
+  if(!liveStroke) return;
+  x.save(); x.strokeStyle='#2f5bd3'; x.lineCap=x.lineJoin='round'; x.lineWidth=Math.max(1,(+$('penW').value||0.4)*sc);
+  x.beginPath(); liveStroke.pts.forEach(([px,py],i)=>i?x.lineTo(bx+px*sc,by+py*sc):x.moveTo(bx+px*sc,by+py*sc));
+  if(liveStroke.pts.length===1) x.lineTo(bx+liveStroke.pts[0][0]*sc+0.1,by+liveStroke.pts[0][1]*sc);
+  x.stroke(); x.restore();
+}
+// 選択・ドラッグの処理より先に（capture で）受け取り、描画中はそちらへ渡さない
+(function(){
+  const cv=$('preview');
+  const take=e=>{ e.preventDefault(); e.stopImmediatePropagation(); };
+  let pid=null;
+  // 紙の外には描けないようにする
+  const clampP=p=>{ const A=drawArea(); return [Math.max(-A.m,Math.min(A.aw+A.m,p.x)),Math.max(-A.m,Math.min(A.ah+A.m,p.y))]; };
+  const onPaper=p=>{ const A=drawArea(); return p.x>=-A.m&&p.y>=-A.m&&p.x<=A.aw+A.m&&p.y<=A.ah+A.m; };
+  cv.addEventListener('pointerdown',e=>{
+    const d=drawActive(); if(!d||e.button>0) return;
+    take(e); if(pid!==null) return;   // 2本目の指などは無視
+    const p=evtPos(e);
+    if(drawTool==='pen'&&!onPaper(p)) return;
+    pid=e.pointerId;
+    try{ cv.setPointerCapture(pid); }catch(_){}
+    if(drawTool==='erase'){ erasing={pushed:false}; eraseAt(d,p); }
+    else { liveStroke={d,pts:[clampP(p)],straight:$('drStraight').checked||e.shiftKey}; draw(); }
+  },true);
+  cv.addEventListener('pointermove',e=>{
+    const d=drawActive(); if(!d) return;
+    take(e); cv.style.cursor=drawTool==='erase'?'cell':'crosshair';
+    if(e.pointerId!==pid) return;
+    if(drawTool==='erase'){ if(erasing) eraseAt(d,evtPos(e)); return; }
+    if(!liveStroke) return;
+    if($('drStraight').checked||e.shiftKey) liveStroke.straight=true;
+    // 速く動かしたときも点を取りこぼさない
+    const evs=e.getCoalescedEvents?e.getCoalescedEvents():[];
+    for(const ev of (evs.length?evs:[e])){
+      const q=clampP(evtPos(ev)), l=liveStroke.pts[liveStroke.pts.length-1];
+      if(liveStroke.straight) liveStroke.pts=[liveStroke.pts[0],q];
+      else if(Math.hypot(q[0]-l[0],q[1]-l[1])>=0.15) liveStroke.pts.push(q);
+    }
+    draw();
+  },true);
+  const end=e=>{
+    if(pid===null||e.pointerId!==pid) return;
+    pid=null; erasing=null; e.stopImmediatePropagation(); commitStroke();
+  };
+  cv.addEventListener('pointerup',end,true);
+  cv.addEventListener('pointercancel',end,true);
+  cv.addEventListener('wheel',e=>{ if(drawActive()) e.stopImmediatePropagation(); },{capture:true,passive:true});
+  document.addEventListener('keydown',e=>{
+    if(editorMode!=='draw'||!(e.ctrlKey||e.metaKey)||e.key.toLowerCase()!=='z') return;
+    const t=document.activeElement&&document.activeElement.tagName; if(t==='INPUT'&&document.activeElement.type!=='range'&&document.activeElement.type!=='checkbox'||t==='TEXTAREA') return;
+    e.preventDefault(); drawUndo(e.shiftKey);
+  });
+})();
+document.querySelectorAll('#drTools button').forEach(b=>b.addEventListener('click',()=>setDrawTool(b.dataset.tool)));
+$('drUndo').onclick=()=>drawUndo(false);
+$('drRedo').onclick=()=>drawUndo(true);
+$('drClear').onclick=()=>{ const d=drawOf(layoutSel); if(!d||!d.strokes.length) return; pushUndo(d); d.strokes=[]; compose(); syncDrawPanel(); };
+$('drSmooth').addEventListener('input',()=>{ $('drSmoothV').textContent=$('drSmooth').value; });
+function dupDrawing(key){
+  const d=drawOf(key); if(!d) return;
+  const n={id:drawSeq++,strokes:copyStrokes(d.strokes).map(s=>s.map(([x,y])=>[x+6,y+6])),undo:[],redo:[]};
+  drawings.push(n);
+  const i=layers.findIndex(l=>l.key===key); layers.splice(i+1,0,{key:'draw:'+n.id,visible:true});
+  setDrawTool('move'); compose(); selectElement('draw:'+n.id);
+}
 
 /* ========== ファイルのドラッグ&ドロップ読み込み ========== */
 (function(){
