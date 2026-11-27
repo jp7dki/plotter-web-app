@@ -112,6 +112,14 @@
   table.cmp th{font-size:11px;color:var(--sub);font-weight:600}
   table.cmp .sel{font-weight:700;color:var(--ink);background:var(--acc-soft)}
   table.cmp td.better{color:var(--ok);font-weight:600} table.cmp td.worse{color:var(--warn);font-weight:600}
+  .fsBar{display:none}
+  body.fsOn{overflow:hidden} body.fsOn .center{z-index:40}
+  #pvCard.fs{position:fixed;inset:0;z-index:40;margin:0;padding:0;border:none;border-radius:0;display:flex;flex-direction:column;background:#e9e6e0}
+  #pvCard.fs .toolbar,#pvCard.fs .stats,#pvCard.fs #layoutHint{display:none}
+  #pvCard.fs .fsBar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+  #pvCard.fs .fsBar button{min-height:44px;padding:6px 14px;font-size:14px}
+  #pvCard.fs .fsBar button[aria-pressed="true"]{background:var(--acc-soft);border-color:var(--acc);color:var(--acc)}
+  #pvCard.fs #preview{flex:1 1 0;min-height:0;max-height:none;width:100%;border-radius:0}
   .addBar{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
   .addBar button{flex-direction:column;justify-content:center;gap:1px;padding:6px 0;font-size:10px;white-space:nowrap;min-width:0;border-radius:9px}
   .addBar button i{font-style:normal;font-size:17px;line-height:1.1}
@@ -335,6 +343,7 @@
     <section class="panel" data-panel="draw" hidden>
       <div class="card">
         <h2>手書き <small>プレビューの紙に直接描けます</small></h2>
+        <button id="fsOpen" class="primary" style="width:100%;justify-content:center;margin-bottom:8px">⛶ 全画面で描く</button>
         <div class="toggle" id="drTools" style="display:flex">
           <button data-tool="pen" class="on" style="flex:1;justify-content:center">ペン</button>
           <button data-tool="erase" style="flex:1;justify-content:center">消しゴム</button>
@@ -406,7 +415,14 @@
 
   <!-- ===== 中央：プレビューと描画 ===== -->
   <section class="center">
-    <div class="card">
+    <div class="card" id="pvCard">
+      <div class="fsBar" role="toolbar" aria-label="手書きの道具">
+        <div class="toggle"><button data-tool="pen" class="on">ペン</button><button data-tool="erase">消しゴム</button><button data-tool="move">移動・拡大</button></div>
+        <button id="fsStraight" aria-pressed="false">直線</button>
+        <button id="fsUndo">元に戻す</button><button id="fsRedo">やり直す</button>
+        <span style="flex:1"></span>
+        <button id="fsExit" class="primary">全画面を閉じる</button>
+      </div>
       <div class="toolbar">
         <span class="chip empty" id="srcLabel">描画内容：なし</span>
         <span style="flex:1"></span>
@@ -728,7 +744,7 @@ $('btnTimer').onclick=()=>{
   const t=setInterval(()=>{ $('camMsg').textContent=n; if(n--===0){clearInterval(t);$('camMsg').style.display='none';capture();} },1000);
   $('camMsg').textContent=n--;
 };
-document.addEventListener('keydown',e=>{ if(e.code==='Space'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('btnShot').disabled){e.preventDefault();capture();}});
+document.addEventListener('keydown',e=>{ if(e.code==='Space'&&!fsOn&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!$('btnShot').disabled){e.preventDefault();capture();}});
 $('file').onchange=e=>{
   const f=e.target.files[0]; if(!f) return;
   const img=new Image(); img.onload=()=>{const c=document.createElement('canvas');c.width=img.width;c.height=img.height;c.getContext('2d').drawImage(img,0,0);setSource(c);URL.revokeObjectURL(img.src);img.src='';};
@@ -1890,6 +1906,7 @@ $('qrTest').onclick=async()=>{
 function draw(){
   const cv=$('preview'), x=cv.getContext('2d');
   const A=drawArea();
+  cv.width=previewWidth(A);
   cv.height=Math.round(cv.width*A.ph/A.pw);
   x.fillStyle='#e9e6e0'; x.fillRect(0,0,cv.width,cv.height);
   const pad=20, sc=Math.min((cv.width-2*pad)/A.pw,(cv.height-2*pad)/A.ph);
@@ -3025,13 +3042,15 @@ function addDrawing(){
 }
 function setDrawTool(t){
   drawTool=t; liveStroke=null;
-  document.querySelectorAll('#drTools button').forEach(b=>b.classList.toggle('on',b.dataset.tool===t));
+  document.querySelectorAll('button[data-tool]').forEach(b=>b.classList.toggle('on',b.dataset.tool===t));
   $('preview').style.cursor='';
   syncDrawPanel(); draw();
 }
 function syncDrawPanel(){
   const d=drawOf(layoutSel);
   $('drUndo').disabled=!d||!d.undo.length; $('drRedo').disabled=!d||!d.redo.length; $('drClear').disabled=!d||!d.strokes.length;
+  $('fsUndo').disabled=$('drUndo').disabled; $('fsRedo').disabled=$('drRedo').disabled;
+  $('fsStraight').setAttribute('aria-pressed',$('drStraight').checked);
   const how={pen:'紙の上をドラッグすると線が描けます。Shift を押しながらだと直線になります。',
     erase:'消したい線をなぞると、線を1本ずつ消せます。',
     move:'ドラッグで移動、四隅の■やホイールで拡大縮小できます。'}[drawTool];
@@ -3126,11 +3145,46 @@ function drawLiveStroke(x,bx,by,sc){
     e.preventDefault(); drawUndo(e.shiftKey);
   });
 })();
-document.querySelectorAll('#drTools button').forEach(b=>b.addEventListener('click',()=>setDrawTool(b.dataset.tool)));
+document.querySelectorAll('button[data-tool]').forEach(b=>b.addEventListener('click',()=>{ fsEnsure(); setDrawTool(b.dataset.tool); }));
 $('drUndo').onclick=()=>drawUndo(false);
 $('drRedo').onclick=()=>drawUndo(true);
 $('drClear').onclick=()=>{ const d=drawOf(layoutSel); if(!d||!d.strokes.length) return; pushUndo(d); d.strokes=[]; compose(); syncDrawPanel(); };
 $('drSmooth').addEventListener('input',()=>{ $('drSmoothV').textContent=$('drSmooth').value; });
+/* ---------- 全画面で描く ---------- */
+var fsOn=false, fsSel=null;
+// 全画面では画面の大きさに合わせて細かく描き、線がぼやけないようにする
+function previewWidth(A){
+  if(!fsOn) return 900;
+  const r=$('preview').getBoundingClientRect(); if(!r.width||!r.height) return 900;
+  return Math.max(300,Math.min(2400,Math.round(Math.min(r.width,r.height*A.pw/A.ph)*(window.devicePixelRatio||1))));
+}
+// 移動中に別のエレメントを選んでいたら、描いていた手書きに戻す（消されていれば新しく作る）
+function fsEnsure(){
+  if(!fsOn||(editorMode==='draw'&&drawOf(layoutSel))) return;
+  if(drawOf(fsSel)) selectElement(fsSel); else { addDrawing(); fsSel=layoutSel; }
+}
+function fsSet(on){
+  if(fsOn===on) return;
+  fsOn=on; $('pvCard').classList.toggle('fs',on); document.body.classList.toggle('fsOn',on);
+  if(on){
+    fsSel=layoutSel; if(view!=='plot') $('tabPlot').click();
+    // ブラウザの全画面表示が使えないとき（iPhone など）は、ページいっぱいの表示になる
+    try{ const p=$('pvCard').requestFullscreen&&$('pvCard').requestFullscreen(); if(p) p.catch(()=>{}); }catch(_){}
+  } else {
+    if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+    const id=fsSel; setTimeout(()=>{ if(drawOf(id)) selectElement(id); },0);
+  }
+  syncDrawPanel(); draw();
+}
+$('fsOpen').onclick=()=>fsSet(true);
+$('fsExit').onclick=()=>fsSet(false);
+$('fsUndo').onclick=()=>{ fsEnsure(); drawUndo(false); };
+$('fsRedo').onclick=()=>{ fsEnsure(); drawUndo(true); };
+$('fsStraight').onclick=()=>{ $('drStraight').checked=!$('drStraight').checked; syncDrawPanel(); };
+$('drStraight').addEventListener('change',syncDrawPanel);
+document.addEventListener('fullscreenchange',()=>{ if(!document.fullscreenElement) fsSet(false); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'&&fsOn) fsSet(false); });
+new ResizeObserver(()=>{ if(fsOn&&!liveStroke) draw(); }).observe($('pvCard'));
 function dupDrawing(key){
   const d=drawOf(key); if(!d) return;
   const n={id:drawSeq++,strokes:copyStrokes(d.strokes).map(s=>s.map(([x,y])=>[x+6,y+6])),undo:[],redo:[]};
