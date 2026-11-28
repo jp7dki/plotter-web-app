@@ -2619,9 +2619,14 @@ function buildTextGeom(text,fontCss,bold){
   });
   // 一筆書き風：文字を細線化して中心線をたどる
   const center=tidy(chainSkeleton(traceEdges(thin(ink,cw,ch),cw,ch),hpx),3,false);
+  // i や ! の点のような小さな印は、細線化すると 1〜2 画素になって上の処理で消えてしまう。
+  // 中心線が1本も通っていない印を探し、点（細長ければ短い線）として描き足す
+  const marks=smallMarks(ink,cw,ch,center,hpx);
+  center.push(...marks.lines.map(p=>p.map(toU)));
+  const dots=marks.dots.map(d=>({u:(d.cx-2)/hpx, v:(d.cy-2)/hpx, r:d.r/hpx}));   // 丸い点は大きさを持たせ、描くときに塗る
   // 輪郭：マーチングスクエア法で、文字と背景の境目を閉じた線として取り出す
   const outline=tidy(marchingSquares(ink,cw,ch),4,true);
-  return {aspect:(cw-4)/hpx, center, outline, ink, cw, ch, hpx, fill:new Map()};
+  return {aspect:(cw-4)/hpx, center, dots, outline, ink, cw, ch, hpx, fill:new Map()};
 }
 // 2値画像の境界線（閉じた折れ線の配列）。座標は画素の中心が整数になる単位
 function marchingSquares(img,w,h){
@@ -2651,6 +2656,38 @@ function marchingSquares(img,w,h){
     out.push(line.map(([x2,y2])=>[x2/2,y2/2]));
   }
   return out;
+}
+// 文字の画像のうち、中心線が通っていない独立した印（点・短い棒）を、ペンで描ける短い線にする。座標は画素
+function smallMarks(ink,w,h,center,hpx){
+  const lab=new Int32Array(w*h).fill(-1), comps=[];
+  for(let i=0;i<w*h;i++){
+    if(!ink[i]||lab[i]>=0) continue;
+    const id=comps.length, st=[i]; lab[i]=id; let n=0,sx=0,sy=0,x0=w,y0=h,x1=0,y1=0;
+    while(st.length){
+      const j=st.pop(), x=j%w, y=(j/w)|0; n++; sx+=x; sy+=y;
+      if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const xx=x+dx, yy=y+dy; if(xx<0||yy<0||xx>=w||yy>=h) continue;
+        const k=yy*w+xx; if(ink[k]&&lab[k]<0){ lab[k]=id; st.push(k); }
+      }
+    }
+    comps.push({n,cx:sx/n,cy:sy/n,x0,y0,x1,y1,hit:false});
+  }
+  // 中心線（単位座標）が通っている印に印を付ける
+  for(const p of center) for(const [u,v] of p){
+    const x=Math.round(u*hpx+2), y=Math.round(v*hpx+2);
+    if(x>=0&&y>=0&&x<w&&y<h&&lab[y*w+x]>=0) comps[lab[y*w+x]].hit=true;
+  }
+  const lines=[], dots=[];
+  for(const c of comps){
+    if(c.hit||c.n<4) continue;   // 4 画素未満はノイズとして無視
+    const bw=c.x1-c.x0+1, bh=c.y1-c.y0+1, r=Math.min(bw,bh)/2;
+    if(Math.max(bw,bh)>2.5*Math.min(bw,bh)){
+      // 細長い印（短い横棒・縦棒）は、長い方向に1本の線
+      lines.push(bw>=bh?[[c.x0+r,c.cy],[c.x1+1-r,c.cy]]:[[c.cx,c.y0+r],[c.cx,c.y1+1-r]]);
+    } else dots.push({cx:c.cx+0.5,cy:c.cy+0.5,r:Math.sqrt(c.n/Math.PI)});   // 丸い点：面積と同じ円
+  }
+  return {lines,dots};
 }
 function textGeom(st){
   const key=[st.text,st.font,st.bold?1:0].join('\u0001');
@@ -2768,7 +2805,18 @@ function textStampGeom(st){
   const T=([u,v])=>{ const x=(u-asp/2)*h, y=(v-0.5)*h; return [cx+x*c-y*s, cy+x*s+y*c]; };
   let paths=(st.tstyle==='center'?g.center:g.outline).map(p=>p.map(T));
   // 一筆書き風：ペン幅より近い切れ目は、ペンを上げずにつなぐ（つなぎ目はペンの太さに隠れる）
-  if(st.tstyle==='center') paths=joinPaths(orderPaths(paths),(+$('penW').value||0.4)*0.75);
+  if(st.tstyle==='center'){
+    paths=joinPaths(orderPaths(paths),(+$('penW').value||0.4)*0.75);
+    // i や ! の点：ペンより大きければ、うず巻きで塗って元の点の大きさにする
+    const pen=+$('penW').value||0.4;
+    for(const d of g.dots||[]){
+      const c=T([d.u,d.v]), R=d.r*h-pen/2;
+      if(R<pen*0.3){ paths.push([c,[c[0]+0.01,c[1]]]); continue; }
+      const turns=Math.max(1,Math.ceil(R/(pen*0.8))), N=turns*24, sp=[];
+      for(let i=0;i<=N;i++){ const t=i/N, a=t*turns*2*Math.PI, r=R*(1-t); sp.push([c[0]+r*Math.cos(a),c[1]+r*Math.sin(a)]); }
+      paths.push(sp);
+    }
+  }
   if(st.tstyle==='fill'){
     const pen=+$('penW').value||0.4, sp=pen*0.85;
     paths=paths.concat(joinPaths(orderPaths(textFill(g,sp/h).map(p=>p.map(T))),sp*0.6));
