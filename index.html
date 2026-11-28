@@ -472,6 +472,9 @@
       <h2>プロッタ接続 <small>grblHAL / Web Serial</small></h2>
       <div class="f2" style="grid-template-columns:1fr auto;align-items:end">
         <div class="fld"><span>ボーレート</span><input type="number" id="baud" value="115200"></div>
+        <div class="fld"><span>送り方</span><select id="streamMode">
+          <option value="buffer" selected>先送り（速い・滑らか）</option>
+          <option value="okwait">1行ずつ ok を待つ</option></select></div>
         <button id="btnConnect" class="primary" style="margin:4px 0">接続</button>
       </div>
       <div class="btns">
@@ -706,7 +709,7 @@ $('btnSetDown').onclick=()=>setPenCmd('penDown','M3S'+$('sTest').value);
 $('btnUpM5').onclick=()=>setPenCmd('penUp','M5');
 
 // 機械設定はブラウザに保存しておく
-const PREF_IDS=['routeMode','retraceMax','qrFill','orient','strokeX','strokeY','outRot','jogFeed','jogInvX','jogInvY','jogKeys','penW','qrEcc','qrSize','qrQuiet','qrPos','qrX','qrY','qrRef','qrPortrait','penMode','penUp','penDown','feedDraw','feedTravel','penDelay','travelCmd','header','footer','baud','origin','flipY','paper','pw','ph','margin'];
+const PREF_IDS=['streamMode','routeMode','retraceMax','qrFill','orient','strokeX','strokeY','outRot','jogFeed','jogInvX','jogInvY','jogKeys','penW','qrEcc','qrSize','qrQuiet','qrPos','qrX','qrY','qrRef','qrPortrait','penMode','penUp','penDown','feedDraw','feedTravel','penDelay','travelCmd','header','footer','baud','origin','flipY','paper','pw','ph','margin'];
 function savePrefs(){try{const o={};PREF_IDS.forEach(id=>{const e=$(id);o[id]=e.type==='checkbox'?e.checked:e.value;});localStorage.setItem('plotterPrefs',JSON.stringify(o));}catch(e){}}
 function loadPrefs(){try{const o=JSON.parse(localStorage.getItem('plotterPrefs')||'null');if(!o)return;PREF_IDS.forEach(id=>{if(id in o){const e=$(id);if(e.type==='checkbox')e.checked=o[id];else e.value=o[id];}});}catch(e){}}
 PREF_IDS.forEach(id=>$(id).addEventListener('change',savePrefs));
@@ -2270,6 +2273,7 @@ $('dlGcode').onclick=()=>{if(finalPaths.length){download(`portrait_${stamp()}.gc
 
 /* ========== シリアル (GRBL ストリーミング) ========== */
 let port=null, writer=null, reader=null, okWaiters=[], readBuf='';
+let infoCapture=null, rxSize=0;   // grblHAL の受信バッファの大きさ（$I で調べる。0＝まだ調べていない）
 const plotState={total:0,sent:0,donePaths:0,paused:false,stop:false,running:false};
 function log(s){const l=$('log');l.textContent+=s+'\n';if(l.textContent.length>20000)l.textContent=l.textContent.slice(-15000);l.scrollTop=l.scrollHeight;}
 function setConnected(on){
@@ -2512,7 +2516,7 @@ $('btnConnect').onclick=async()=>{
   try{
     const p=await navigator.serial.requestPort();
     await p.open({baudRate:+$('baud').value});
-    port=p; writer=port.writable.getWriter(); readBuf=''; okWaiters=[];
+    port=p; writer=port.writable.getWriter(); readBuf=''; okWaiters=[]; rxSize=0;
     keepReading=true; readLoopDone=readLoop();
     setConnected(true); log('接続しました');
     setTimeout(()=>sendRaw('\r\n\r\n'),500);
@@ -2565,7 +2569,8 @@ async function readLoop(){
   if(keepReading&&port) setTimeout(()=>disconnect('⚠ プロッタとの通信が止まりました'),0);
 }
 function onLine(line){
-  if(gsCapture&&(/^\$\d+=/.test(line)||line.startsWith('[SETTING:'))){ gsCapture.push(line); return; }   // 設定一覧はログに流さず集める
+  if(gsCapture&&(/^\$\d+=/.test(line)||line.startsWith('[SETTING:'))){ gsCapture.push(line); return; }
+  if(infoCapture&&line[0]==='['){ infoCapture.push(line); return; }   // $I（機器の情報）の応答   // 設定一覧はログに流さず集める
   if(line[0]==='<'){ onStatus(line); if(statusReq){ log('← '+line); statusReq=false; } return; }   // 定期的な位置問い合わせの応答はログに出さない
   if(line==='ok'||line.startsWith('error')){ if(line!=='ok')log('← '+line); const w=okWaiters.shift(); w&&w(line); }
   else log('← '+line);
@@ -2597,26 +2602,61 @@ $('btnSettings').onclick=()=>sendCmds(['$$']);
 $('btnSend').onclick=()=>{const v=$('manual').value.trim();if(v){sendCmds([v]);$('manual').value='';}};
 $('manual').addEventListener('keydown',e=>{if(e.key==='Enter')$('btnSend').click();});
 
+// grblHAL の受信バッファの大きさを $I の [OPT:…,ブロック数,受信バッファ] から調べる（分からなければ GRBL 標準の 128）
+async function detectRxSize(){
+  if(rxSize) return rxSize;
+  infoCapture=[]; const r=await sendLine('$I'); const info=infoCapture; infoCapture=null;
+  if(r==='disconnected') return 0;
+  const o=info.find(l=>l.startsWith('[OPT:')), f=o?o.slice(5,-1).split(','):[], n=+f[2];
+  rxSize = n>=64&&n<=16384 ? n : 128;
+  log(`受信バッファ：${rxSize} バイト${o?'':'（$I に情報が無いため、GRBL 標準の値を使います）'}`);
+  return rxSize;
+}
+// 送り方
+//  先送り：受信バッファがあふれない範囲で、ok を待たずに次の行を送る（GRBL 推奨の「文字数を数える」方式）。
+//          grblHAL が先の線まで見越して速度を計画できるので、短い線が続いても止まらずに描ける
+//  1行ずつ：1行送るたびに ok を待つ（従来の方式）
 $('btnPlot').onclick=async()=>{
   if(!finalPaths.length||plotState.running)return;
   autoConfirm();
   const {lines,pmap}=plotLines();
-  Object.assign(plotState,{total:lines.length,sent:0,donePaths:0,paused:false,stop:false,running:true,aborted:''});
+  Object.assign(plotState,{total:lines.length,sent:0,acked:0,donePaths:0,paused:false,stop:false,running:true,aborted:''});
   $('btnPlot').disabled=true;$('btnPause').disabled=false;$('btnStop').disabled=false;
-  const t0=Date.now();
-  for(let li=0;li<lines.length;li++){
+  const t0=Date.now(), buffered=$('streamMode').value==='buffer';
+  const cap=buffered ? Math.max(32,(await detectRxSize())-2) : 0;   // 念のため少し余裕を残す
+  const enc=new TextEncoder(), inflight=[]; let used=0, errors=0;
+  const progress=()=>{ $('prog').value=plotState.acked/plotState.total;
+    const el=(Date.now()-t0)/1000, rem=plotState.acked?el/plotState.acked*(plotState.total-plotState.acked):0;
+    $('progTxt').textContent=`${plotState.donePaths}/${finalPaths.length} 本　経過 ${Math.round(el)}秒　残り約 ${Math.round(rem/60)}分`; draw(); };
+  // いちばん古い送信中の行の応答を待つ
+  const settle=async()=>{
+    const f=inflight.shift(), r=await f.res; used-=f.n;
+    if(r==='disconnected'){ plotState.stop=true; plotState.aborted='接続が切れたため中断しました'; return false; }
+    if(r==='reset') return false;
+    if(typeof r==='string'&&r.startsWith('error')){ errors++; log(`← ${r}（${f.line}）`); }
+    plotState.acked=f.idx+1; if(f.path!=null) plotState.donePaths=f.path;
+    if(plotState.acked%20===0) progress();
+    return true;
+  };
+  let path=null;
+  for(let li=0;li<lines.length&&!plotState.stop;li++){
     const l=lines[li];
-    if(plotState.stop)break;
     while(plotState.paused&&!plotState.stop) await new Promise(r=>setTimeout(r,100));
-    if(pmap) plotState.donePaths=pmap[li];
-    if(l.startsWith(';')){ const m=l.match(/path (\d+)/); if(m){plotState.donePaths=+m[1];} plotState.sent++; continue; }
-    if(await sendLine(l)==='disconnected'){ plotState.stop=true; plotState.aborted='接続が切れたため中断しました'; break; }
-    plotState.sent++;
-    if(plotState.sent%20===0){ $('prog').value=plotState.sent/plotState.total;
-      const el=(Date.now()-t0)/1000, rem=el/plotState.sent*(plotState.total-plotState.sent);
-      $('progTxt').textContent=`${plotState.donePaths}/${finalPaths.length} 本　経過 ${Math.round(el)}秒　残り約 ${Math.round(rem/60)}分`; draw(); }
+    if(plotState.stop) break;
+    if(pmap) path=pmap[li];
+    if(l.startsWith(';')){ const m=l.match(/path (\d+)/); if(m) path=+m[1]; plotState.sent++; continue; }
+    const n=enc.encode(l+'\n').length;
+    // 先送り：入りきらない間は、古い行の ok を待って空きを作る。1行ずつ：毎回 ok を待つ
+    while(inflight.length&&(buffered ? used+n>cap : true)){ if(!(await settle())) break; }
+    if(plotState.stop) break;
+    if(!writer){ plotState.stop=true; plotState.aborted='接続が切れたため中断しました'; break; }
+    inflight.push({res:sendLine(l),n,idx:li,line:l,path}); used+=n; plotState.sent++;
   }
-  if(!plotState.stop){ $('prog').value=1; plotState.donePaths=finalPaths.length; $('progTxt').textContent='完了しました'; log('描画完了'); }
+  while(inflight.length&&!plotState.stop){ if(!(await settle())) break; }
+  // ok は「受け付けた」という意味なので、最後の線を描き終わるまで待つ（G4 P0 はバッファが空になってから ok を返す）
+  if(!plotState.stop&&writer){ $('progTxt').textContent='最後の線を描いています…'; const r=await sendLine('G4 P0'); if(r==='disconnected'){ plotState.stop=true; plotState.aborted='接続が切れたため中断しました'; } }
+  if(!plotState.stop){ $('prog').value=1; plotState.donePaths=finalPaths.length; const sec=Math.round((Date.now()-t0)/1000);
+    $('progTxt').textContent=`完了しました（${Math.floor(sec/60)}分${sec%60}秒）`; log(`描画完了（${sec}秒${errors?`、エラー ${errors} 件`:''}）`); }
   if(plotState.aborted){ $('progTxt').textContent=plotState.aborted+'（位置がずれている可能性があります。原点を確認してください）'; log(plotState.aborted); }
   plotState.running=false; draw(); plotState.total=0;
   $('btnPlot').disabled=!port;$('btnPause').disabled=true;$('btnStop').disabled=true;$('btnPause').textContent='一時停止';
