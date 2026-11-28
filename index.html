@@ -2007,14 +2007,17 @@ function buildGcode(){
   const L=[], dwell=dl>0?`G4 P${dl}`:null;
   L.push(...$('header').value.split('\n').map(s=>s.trim()).filter(Boolean));
   L.push(up); if(dwell)L.push(dwell);
+  // 次の線が今の線の終わりとほぼ同じ位置（0.05mm 以内）から始まるなら、ペンを上げずにそのまま続ける
+  const touch=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1])<=0.05;
   finalPaths.forEach((p,k)=>{
+    const cont=k>0&&touch(finalPaths[k-1][finalPaths[k-1].length-1],p[0]);
     const [x0,y0]=toMachine(...p[0]);
     L.push(`; path ${k}`);
-    L.push(`${tc} X${x0} Y${y0}${tc==='G1'?' F'+ft:''}`);
-    L.push(down); if(dwell)L.push(dwell);
+    if(!cont){ L.push(`${tc} X${x0} Y${y0}${tc==='G1'?' F'+ft:''}`); L.push(down); if(dwell)L.push(dwell); }
     let first=true;
-    for(let i=1;i<p.length;i++){const [x,y]=toMachine(...p[i]);L.push(`G1 X${x} Y${y}${first?' F'+fd:''}`);first=false;}
-    L.push(up); if(dwell)L.push(dwell);
+    for(let i=cont?0:1;i<p.length;i++){const [x,y]=toMachine(...p[i]);L.push(`G1 X${x} Y${y}${first?' F'+fd:''}`);first=false;}
+    const next=finalPaths[k+1];
+    if(!(next&&touch(p[p.length-1],next[0]))){ L.push(up); if(dwell)L.push(dwell); }
   });
   L.push(...$('footer').value.split('\n').map(s=>s.trim()).filter(Boolean));
   return L;
@@ -2615,7 +2618,7 @@ function buildTextGeom(text,fontCss,bold){
     return chaikin(rdp(p,0.7),1).map(toU);
   });
   // 一筆書き風：文字を細線化して中心線をたどる
-  const center=tidy(traceEdges(thin(ink,cw,ch),cw,ch),3,false);
+  const center=tidy(chainSkeleton(traceEdges(thin(ink,cw,ch),cw,ch),hpx),3,false);
   // 輪郭：マーチングスクエア法で、文字と背景の境目を閉じた線として取り出す
   const outline=tidy(marchingSquares(ink,cw,ch),4,true);
   return {aspect:(cw-4)/hpx, center, outline, ink, cw, ch, hpx, fill:new Map()};
@@ -2656,26 +2659,119 @@ function textGeom(st){
   return g;
 }
 // 塗りつぶし：文字の画素を横方向に走査して線にする（穴のある文字も正しく塗れる）
+// 塗りつぶし：文字の画素を横方向に走査して線にする（穴のある文字も正しく塗れる）。
+// 下の線に「文字の内側だけを通って」移れるときはペンを上げずにつなぎ、上げ下げを減らす
 function textFill(g,spacingUnit){
   const sp=Math.max(1,spacingUnit*g.hpx), key=sp.toFixed(2);
   if(g.fill.has(key)) return g.fill.get(key);
-  const out=[]; let flip=false;
+  const W=g.cw, ink=g.ink, lines=[];
   for(let y=2+sp/2;y<g.ch-2;y+=sp){
-    const row=Math.round(y), segs=[]; let s=-1;
-    for(let xx=0;xx<=g.cw;xx++){ const on=xx<g.cw&&g.ink[row*g.cw+xx]; if(on&&s<0) s=xx; else if(!on&&s>=0){ if(xx-s>=2) segs.push([[s+0.5,y],[xx-0.5,y]]); s=-1; } }
-    if(flip){ segs.reverse(); segs.forEach(q=>q.reverse()); }
-    flip=!flip; out.push(...segs);
+    const row=Math.round(y), ivs=[]; let s=-1;
+    for(let x=0;x<=W;x++){ const on=x<W&&ink[row*W+x]; if(on&&s<0) s=x; else if(!on&&s>=0){ if(x-s>=2) ivs.push({a:s+0.5,b:x-0.5,used:false}); s=-1; } }
+    lines.push({y,row,ivs});
   }
-  const res=out.map(p=>p.map(([px,py])=>[(px-2)/g.hpx,(py-2)/g.hpx]));
+  // 2本の線のあいだを縦に移るとき、その縦線がずっと文字の内側にあるか
+  const colInk=(x,r0,r1)=>{ const c=Math.round(x); for(let r=r0;r<=r1;r++) if(!ink[r*W+c]) return false; return true; };
+  const linkX=(cur,nv,x,l0,l1)=>{
+    const o0=Math.max(cur.a,nv.a), o1=Math.min(cur.b,nv.b); if(o1<o0) return null;
+    const st=Math.min(Math.max(x,o0),o1);
+    for(let d=0;d<=o1-o0+1;d++) for(const xc of [st-d,st+d]) if(xc>=o0-1e-9&&xc<=o1+1e-9&&colInk(xc,l0.row,l1.row)) return xc;
+    return null;
+  };
+  const topFree=(li,iv)=>{ const pl=lines[li-1]; return !pl||!pl.ivs.some(pv=>!pv.used&&linkX(pv,iv,(iv.a+iv.b)/2,pl,lines[li])!==null); };
+  const out=[]; let px=0, py=0;
+  for(;;){
+    let best=null, bd=Infinity;
+    for(let li=0;li<lines.length;li++) for(const iv of lines[li].ivs){
+      if(iv.used||!topFree(li,iv)) continue;
+      for(const xe of [iv.a,iv.b]){ const d=(xe-px)**2+(lines[li].y-py)**2; if(d<bd){ bd=d; best={li,iv,x:xe}; } }
+    }
+    if(!best) break;
+    let li=best.li, cur=best.iv; const y0=lines[li].y;
+    let x=best.x===cur.a?cur.b:cur.a;
+    const path=[[best.x,y0],[x,y0]]; cur.used=true;
+    for(;;){
+      const nl=lines[li+1]; if(!nl) break;
+      let cand=null, cd=Infinity;
+      for(const nv of nl.ivs){ if(nv.used) continue; const xc=linkX(cur,nv,x,lines[li],nl); if(xc===null) continue; const d=Math.abs(xc-x); if(d<cd){ cd=d; cand={nv,xc}; } }
+      if(!cand) break;
+      const {nv,xc}=cand;
+      if(Math.abs(xc-x)>1e-9) path.push([xc,lines[li].y]);
+      path.push([xc,nl.y]);
+      const near=(xc-nv.a<=nv.b-xc)?nv.a:nv.b, far=near===nv.a?nv.b:nv.a;
+      if(Math.abs(near-xc)>1e-9) path.push([near,nl.y]);
+      path.push([far,nl.y]);
+      nv.used=true; cur=nv; x=far; li++;
+    }
+    out.push(path); px=path[path.length-1][0]; py=path[path.length-1][1];
+  }
+  const res=out.map(p=>p.map(([X,Y])=>[(X-2)/g.hpx,(Y-2)/g.hpx]));
   g.fill.set(key,res); return res;
+}
+// 一筆書き風の線（細線化した骨格）を、ペンの上げ下げが少なくなるようにつなぎ直す。座標は画素
+function chainSkeleton(paths,hpx){
+  const tol=3, t2=tol*tol, d2=(a,b)=>(a[0]-b[0])**2+(a[1]-b[1])**2;
+  let P=paths.filter(p=>p.length).map(p=>p.slice());
+  // 1) T字の分かれ目：ほかの線の端がこの線の途中に触れていたら、そこで分けて端どうしにする
+  { const E=[]; P.forEach((p,i)=>{ E.push([p[0],i]); E.push([p[p.length-1],i]); });
+    const out=[];
+    P.forEach((p,i)=>{
+      const cut=new Set();
+      for(const [e,j] of E){ if(j===i) continue; let bk=-1,bd=t2; for(let k=1;k<p.length-1;k++){ const dd=d2(p[k],e); if(dd<=bd){ bd=dd; bk=k; } } if(bk>0) cut.add(bk); }
+      if(!cut.size){ out.push(p); return; }
+      let st=0; for(const k of [...cut].sort((a,b)=>a-b)){ out.push(p.slice(st,k+1)); st=k; } out.push(p.slice(st));
+    });
+    P=out;
+  }
+  const attached=(pt,i)=>P.some((q,j)=>j!==i&&(d2(q[0],pt)<=t2||d2(q[q.length-1],pt)<=t2));
+  // 2) 細線化でできる短い「ひげ」（片方の端だけほかの線につながった、ごく短い線）を除く
+  const spur=Math.max(3,hpx*0.06);
+  P=P.filter((p,i)=>pathLen(p)>=spur||attached(p[0],i)===attached(p[p.length-1],i));
+  // 3) 端がつながる線を、なるべく真っすぐ続く向きを選んでつなげ、長い一筆にする
+  const inward=q=>{ const k=Math.min(q.length-1,3); return [q[k][0]-q[0][0],q[k][1]-q[0][1]]; };
+  const used=new Uint8Array(P.length); let C=[];
+  for(let i=0;i<P.length;i++){
+    if(used[i]) continue; used[i]=1; let cur=P[i].slice();
+    for(const tail of [true,false]){
+      for(;;){
+        const n=cur.length, end=tail?cur[n-1]:cur[0], k=Math.min(n-1,3), prev=tail?cur[n-1-k]:cur[k], od=[end[0]-prev[0],end[1]-prev[1]];
+        let best=-1, bs=-Infinity, flip=false;
+        for(let j=0;j<P.length;j++){
+          if(used[j]) continue; const q=P[j];
+          for(const r of [false,true]){
+            const qq=r?q.slice().reverse():q; if(d2(qq[0],end)>t2) continue;
+            const qd=inward(qq), sc=(od[0]*qd[0]+od[1]*qd[1])/((Math.hypot(od[0],od[1])||1)*(Math.hypot(qd[0],qd[1])||1));
+            if(sc>bs){ bs=sc; best=j; flip=r; }
+          }
+        }
+        if(best<0) break;
+        used[best]=1; const q=flip?P[best].slice().reverse():P[best].slice();   // q[0] がつなぎ目
+        cur=tail?cur.concat(q.slice(1)):q.reverse().concat(cur.slice(1));
+      }
+    }
+    C.push(cur);
+  }
+  // 4) 片方だけつながった短い枝（と、ごく短いつなぎの線）は「行って戻る」ようになぞり、ペンを上げずに描く
+  const maxExc=hpx*0.2, tiny=hpx*0.12;
+  C.sort((a,b)=>pathLen(a)-pathLen(b));
+  for(let i=0;i<C.length;i++){
+    const B=C[i]; if(!B||pathLen(B)>maxExc) continue;
+    const hit=pt=>{ for(let j=0;j<C.length;j++){ if(j===i||!C[j]) continue; const A=C[j]; for(let k=0;k<A.length;k++) if(d2(A[k],pt)<=t2) return {j,k}; } return null; };
+    const h0=hit(B[0]), h1=hit(B[B.length-1]); if(!h0&&!h1) continue; if(h0&&h1&&pathLen(B)>tiny) continue;
+    const h=h0||h1, b=h0?B:B.slice().reverse(), A=C[h.j];
+    C[h.j]=A.slice(0,h.k+1).concat(b, b.slice().reverse(), A.slice(h.k)); C[i]=null;
+  }
+  return C.filter(Boolean);
 }
 function textStampGeom(st){
   const g=textGeom(st), asp=g.aspect, h=st.h, cx=st.x0+st.w/2, cy=st.y0+st.h/2, a=(st.rot||0)*Math.PI/180, c=Math.cos(a), s=Math.sin(a);
   const T=([u,v])=>{ const x=(u-asp/2)*h, y=(v-0.5)*h; return [cx+x*c-y*s, cy+x*s+y*c]; };
   let paths=(st.tstyle==='center'?g.center:g.outline).map(p=>p.map(T));
+  // 一筆書き風：ペン幅より近い切れ目は、ペンを上げずにつなぐ（つなぎ目はペンの太さに隠れる）
+  if(st.tstyle==='center') paths=joinPaths(orderPaths(paths),(+$('penW').value||0.4)*0.75);
   if(st.tstyle==='fill'){
     const pen=+$('penW').value||0.4, sp=pen*0.85;
-    paths=paths.concat(joinPaths(orderPaths(textFill(g,sp/h).map(p=>p.map(T))),sp*1.6));
+    paths=paths.concat(joinPaths(orderPaths(textFill(g,sp/h).map(p=>p.map(T))),sp*0.6));
   }
   const pd=0.12, rect=_poly([[-pd,-pd],[asp+pd,-pd],[asp+pd,1+pd],[-pd,1+pd]]).map(T);
   return {paths:orderPaths(paths), clearRings:[rect]};
