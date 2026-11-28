@@ -2170,13 +2170,21 @@ function draw(){
   drawLayoutOverlay(x,bx,by,sc);
   drawLiveStroke(x,bx,by,sc);
 }
-function updateStats(){
-  if(!finalPaths.length){$("stats").textContent="";return;}
+// 秒 → 「○分○秒」
+const fmtSec=s=>{ s=Math.max(0,Math.round(s)); return s>=60?`${Math.floor(s/60)}分${s%60}秒`:`${s}秒`; };
+// 描く線の量と、速度設定からの推定時間（加減速は考えないので、実際より短めに出る）
+function plotEstimate(){
   let draw=0,travel=0,px=0,py=0;
   for(const p of finalPaths){travel+=Math.hypot(p[0][0]-px,p[0][1]-py);draw+=pathLen(p);px=p[p.length-1][0];py=p[p.length-1][1];}
   const fd=+$('feedDraw').value,ft=+$('feedTravel').value,dl=+$('penDelay').value;
   const lifts=penLifts(finalPaths), sec=draw/fd*60+travel/ft*60+lifts*dl*2;
-  $('stats').innerHTML=`ペン上げ <b>${lifts}</b> 回　描画距離 <b>${(draw/1000).toFixed(2)} m</b>　移動距離 <b>${(travel/1000).toFixed(2)} m</b>　推定時間 <b>${Math.floor(sec/60)}分${Math.round(sec%60)}秒</b>${imported?'':`　処理 <b>${$('stats').dataset.ms||'-'}ms</b>`}`;
+  return {draw,travel,lifts,sec,sig:`${finalPaths.length}|${lifts}|${draw.toFixed(1)}|${travel.toFixed(1)}`};
+}
+var lastRun=null;   // 前回最後まで描いたときの実測 {sig, sec, est}
+function updateStats(){
+  if(!finalPaths.length){$("stats").textContent="";return;}
+  const e=plotEstimate(), run=lastRun&&lastRun.sig===e.sig?lastRun:null;   // 同じ内容を描いたときだけ実測を出す
+  $('stats').innerHTML=`ペン上げ <b>${e.lifts}</b> 回　描画距離 <b>${(e.draw/1000).toFixed(2)} m</b>　移動距離 <b>${(e.travel/1000).toFixed(2)} m</b>　推定時間 <b>${fmtSec(e.sec)}</b>${run?`　実描画時間 <b>${fmtSec(run.sec)}</b>`:''}${imported?'':`　処理 <b>${$('stats').dataset.ms||'-'}ms</b>`}`;
 }
 ['feedDraw','feedTravel','penDelay'].forEach(id=>$(id).addEventListener('change',updateStats));
 const ROUTE_NOTE={near:'エレメントごとに、近い線から順に描きます（従来の描き方）。',
@@ -2620,14 +2628,17 @@ $('btnPlot').onclick=async()=>{
   if(!finalPaths.length||plotState.running)return;
   autoConfirm();
   const {lines,pmap}=plotLines();
-  Object.assign(plotState,{total:lines.length,sent:0,acked:0,donePaths:0,paused:false,stop:false,running:true,aborted:''});
+  Object.assign(plotState,{total:lines.length,sent:0,acked:0,donePaths:0,paused:false,stop:false,running:true,aborted:'',pausedMs:0,pauseAt:0});
+  const est=plotEstimate();
   $('btnPlot').disabled=true;$('btnPause').disabled=false;$('btnStop').disabled=false;
-  const t0=Date.now(), buffered=$('streamMode').value==='buffer';
+  const buffered=$('streamMode').value==='buffer';
   const cap=buffered ? Math.max(32,(await detectRxSize())-2) : 0;   // 念のため少し余裕を残す
+  // 実描画時間：最初の行を送ってから描き終わるまで。一時停止していた時間は含めない
+  const t0=Date.now(), active=()=>(Date.now()-t0-plotState.pausedMs-(plotState.paused&&plotState.pauseAt?Date.now()-plotState.pauseAt:0))/1000;
   const enc=new TextEncoder(), inflight=[]; let used=0, errors=0;
   const progress=()=>{ $('prog').value=plotState.acked/plotState.total;
-    const el=(Date.now()-t0)/1000, rem=plotState.acked?el/plotState.acked*(plotState.total-plotState.acked):0;
-    $('progTxt').textContent=`${plotState.donePaths}/${finalPaths.length} 本　経過 ${Math.round(el)}秒　残り約 ${Math.round(rem/60)}分`; draw(); };
+    const el=active(), rem=plotState.acked?el/plotState.acked*(plotState.total-plotState.acked):0;
+    $('progTxt').textContent=`${plotState.donePaths}/${finalPaths.length} 本　経過 ${fmtSec(el)}　残り約 ${fmtSec(rem)}`; draw(); };
   // いちばん古い送信中の行の応答を待つ
   const settle=async()=>{
     const f=inflight.shift(), r=await f.res; used-=f.n;
@@ -2655,14 +2666,19 @@ $('btnPlot').onclick=async()=>{
   while(inflight.length&&!plotState.stop){ if(!(await settle())) break; }
   // ok は「受け付けた」という意味なので、最後の線を描き終わるまで待つ（G4 P0 はバッファが空になってから ok を返す）
   if(!plotState.stop&&writer){ $('progTxt').textContent='最後の線を描いています…'; const r=await sendLine('G4 P0'); if(r==='disconnected'){ plotState.stop=true; plotState.aborted='接続が切れたため中断しました'; } }
-  if(!plotState.stop){ $('prog').value=1; plotState.donePaths=finalPaths.length; const sec=Math.round((Date.now()-t0)/1000);
-    $('progTxt').textContent=`完了しました（${Math.floor(sec/60)}分${sec%60}秒）`; log(`描画完了（${sec}秒${errors?`、エラー ${errors} 件`:''}）`); }
+  if(!plotState.stop){ $('prog').value=1; plotState.donePaths=finalPaths.length;
+    const sec=active(), held=plotState.pausedMs/1000;
+    const msg=`実描画時間 ${fmtSec(sec)}（推定 ${fmtSec(est.sec)}）${held>=1?`　一時停止 ${fmtSec(held)}`:''}`;
+    $('progTxt').textContent='完了しました　'+msg;
+    log(`描画完了：${msg}　送り方：${buffered?'先送り':'1行ずつ'}${errors?`　エラー ${errors} 件`:''}`);
+    lastRun={sig:est.sig,sec,est:est.sec}; updateStats(); }
   if(plotState.aborted){ $('progTxt').textContent=plotState.aborted+'（位置がずれている可能性があります。原点を確認してください）'; log(plotState.aborted); }
   plotState.running=false; draw(); plotState.total=0;
   $('btnPlot').disabled=!port;$('btnPause').disabled=true;$('btnStop').disabled=true;$('btnPause').textContent='一時停止';
 };
 $('btnPause').onclick=async()=>{
   plotState.paused=!plotState.paused;
+  if(plotState.paused) plotState.pauseAt=Date.now(); else if(plotState.pauseAt){ plotState.pausedMs+=Date.now()-plotState.pauseAt; plotState.pauseAt=0; }
   await sendRaw(plotState.paused?'!':'~');   // GRBL フィードホールド / 再開
   $('btnPause').textContent=plotState.paused?'再開':'一時停止';
 };
