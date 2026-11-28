@@ -623,6 +623,13 @@
         <div class="fld"><span>移動速度 mm/min</span><input type="number" id="feedTravel" value="5000"></div>
         <div class="fld"><span>移動コマンド</span><select id="travelCmd"><option value="G0">G0</option><option value="G1">G1 (F指定)</option></select></div>
       </div>
+      <div class="sub">描き順（ペンの上げ下げ）</div>
+      <div class="fld"><span>描き順</span><select id="routeMode">
+        <option value="near">標準（近い順）</option>
+        <option value="join">一筆書き優先</option>
+        <option value="retrace" selected>一筆書き優先＋描いた線をなぞって移動</option></select></div>
+      <div class="f2" id="retraceFld"><div class="fld"><span>なぞる長さの上限 mm</span><input type="number" id="retraceMax" value="10" min="0" step="1"></div></div>
+      <div class="note" id="routeNote"></div>
       <div class="fld"><span>開始G-code</span><textarea id="header" rows="3">G21
 G90
 G17</textarea></div>
@@ -699,7 +706,7 @@ $('btnSetDown').onclick=()=>setPenCmd('penDown','M3S'+$('sTest').value);
 $('btnUpM5').onclick=()=>setPenCmd('penUp','M5');
 
 // 機械設定はブラウザに保存しておく
-const PREF_IDS=['qrFill','orient','strokeX','strokeY','outRot','jogFeed','jogInvX','jogInvY','jogKeys','penW','qrEcc','qrSize','qrQuiet','qrPos','qrX','qrY','qrRef','qrPortrait','penMode','penUp','penDown','feedDraw','feedTravel','penDelay','travelCmd','header','footer','baud','origin','flipY','paper','pw','ph','margin'];
+const PREF_IDS=['routeMode','retraceMax','qrFill','orient','strokeX','strokeY','outRot','jogFeed','jogInvX','jogInvY','jogKeys','penW','qrEcc','qrSize','qrQuiet','qrPos','qrX','qrY','qrRef','qrPortrait','penMode','penUp','penDown','feedDraw','feedTravel','penDelay','travelCmd','header','footer','baud','origin','flipY','paper','pw','ph','margin'];
 function savePrefs(){try{const o={};PREF_IDS.forEach(id=>{const e=$(id);o[id]=e.type==='checkbox'?e.checked:e.value;});localStorage.setItem('plotterPrefs',JSON.stringify(o));}catch(e){}}
 function loadPrefs(){try{const o=JSON.parse(localStorage.getItem('plotterPrefs')||'null');if(!o)return;PREF_IDS.forEach(id=>{if(id in o){const e=$(id);if(e.type==='checkbox')e.checked=o[id];else e.value=o[id];}});}catch(e){}}
 PREF_IDS.forEach(id=>$(id).addEventListener('change',savePrefs));
@@ -1166,6 +1173,226 @@ function orderPaths(paths){
   return out;
 }
 
+/* ---------- 一筆書き優先の描き順 ----------
+   すべての線を「点（交点・端点）と、それをつなぐ辺」のネットワークにして、
+   ペンを下ろしたまま、まだ描いていない辺をなるべく続けてたどる。
+   - 端点が別の線から snap mm 以内にあれば、つながっているとみなす
+   - 線どうしが交差する所も、乗り換えられる点にする
+   - 線の端どうしが bridge mm（ペン幅）以内なら、短い線でつなぐ
+   - retrace mm 以内なら、描いた線の上をもう一度なぞって次の線へ移る（0 ならなぞらない）
+   - そのうえで一筆書き（オイラー路）を作り、続けられない所だけペンを上げる */
+function routePaths(paths,snap,retrace,bridge){
+  if(paths.length<2&&!(paths[0]&&paths[0].length>2)) return paths;
+  const X=[],Y=[],segA=[],segB=[],segPath=[],segArc=[],ends=[],tiny=[],pathOf=[],arcOf=[];
+  const pTot=[],pFirst=[],pLast=[];
+  for(let pi=0;pi<paths.length;pi++){
+    const p=paths[pi]; if(!p.length) continue;
+    if(pathLen(p)<snap*2.5){ tiny.push(p); continue; }   // 点や短すぎる線はつなぎ処理に入れない（つぶれないように）
+    let prev=-1, arc=0;
+    for(let i=0;i<p.length;i++){
+      if(prev>=0){ const d=Math.hypot(p[i][0]-X[prev],p[i][1]-Y[prev]); if(d<1e-6) continue; }
+      const v=X.length; X.push(p[i][0]); Y.push(p[i][1]); pathOf.push(pi);
+      if(prev>=0){ arc+=Math.hypot(X[v]-X[prev],Y[v]-Y[prev]); segA.push(prev); segB.push(v); segPath.push(pi); segArc.push(arc); }
+      arcOf.push(arc);
+      if(prev<0) ends.push(v);
+      prev=v;
+    }
+    if(prev>=0&&ends[ends.length-1]!==prev) ends.push(prev);
+    pTot[pi]=arc; pFirst[pi]=ends[ends.length-2]??prev; pLast[pi]=prev;
+  }
+  const nV0=X.length, nS=segA.length;
+  if(!nS) return orderPaths(paths);
+  // 辺の位置で引ける格子
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+  for(let i=0;i<nV0;i++){ if(X[i]<x0)x0=X[i]; if(Y[i]<y0)y0=Y[i]; if(X[i]>x1)x1=X[i]; if(Y[i]>y1)y1=Y[i]; }
+  const C=Math.max(1,snap*4), gw=Math.max(1,Math.ceil((x1-x0)/C)+1), gh=Math.max(1,Math.ceil((y1-y0)/C)+1);
+  const cell=new Map();
+  const cx=x=>Math.max(0,Math.min(gw-1,Math.floor((x-x0)/C))), cy=y=>Math.max(0,Math.min(gh-1,Math.floor((y-y0)/C)));
+  for(let s=0;s<nS;s++){
+    const a=segA[s],b=segB[s];
+    const i0=cx(Math.min(X[a],X[b])-snap),i1=cx(Math.max(X[a],X[b])+snap),j0=cy(Math.min(Y[a],Y[b])-snap),j1=cy(Math.max(Y[a],Y[b])+snap);
+    for(let j=j0;j<=j1;j++)for(let i=i0;i<=i1;i++){ const k=j*gw+i; let L=cell.get(k); if(!L) cell.set(k,L=[]); L.push(s); }
+  }
+  const par=new Int32Array(nV0).map((_,i)=>i), find=i=>{ if(i>=nV0) return i; while(par[i]!==i){ par[i]=par[par[i]]; i=par[i]; } return i; };   // 交点（後から足す点）はまとめない
+  // まとめた点は代表の点の位置に寄せる。まとめが連鎖して、代表から snap より離れた点ができないようにする
+  const bx0=new Float64Array(par.length),by0=new Float64Array(par.length),bx1=new Float64Array(par.length),by1=new Float64Array(par.length);
+  for(let i=0;i<nV0;i++){ bx0[i]=bx1[i]=X[i]; by0[i]=by1[i]=Y[i]; }
+  const uniteNear=(a,b)=>{ a=find(a); b=find(b); if(a===b) return;
+    const x0=Math.min(bx0[a],bx0[b]),y0=Math.min(by0[a],by0[b]),x1=Math.max(bx1[a],bx1[b]),y1=Math.max(by1[a],by1[b]);
+    if(Math.hypot(Math.max(X[a]-x0,x1-X[a]),Math.max(Y[a]-y0,y1-Y[a]))>snap) return;
+    par[b]=a; bx0[a]=x0; by0[a]=y0; bx1[a]=x1; by1[a]=y1; };
+  const isClosed=[];
+  for(const pi in pLast){ const a=pFirst[pi],b=pLast[pi]; if(a!==b&&Math.hypot(X[a]-X[b],Y[a]-Y[b])<=0.05){ isClosed[pi]=true; uniteNear(a,b); } }
+  const splits=new Map(), addSplit=(s,t,v)=>{ let L=splits.get(s); if(!L) splits.set(s,L=[]); L.push([t,v]); };
+  // 同じ線の、すぐ近くの部分にはつながない（小さな丸がつぶれないように）
+  const farOnSame=(v,s,t)=>{ const pi=segPath[s]; if(pi!==pathOf[v]) return true;
+    const at=segArc[s]-(1-t)*Math.hypot(X[segB[s]]-X[segA[s]],Y[segB[s]]-Y[segA[s]]), d=Math.abs(at-arcOf[v]);
+    return Math.min(d,isClosed[pi]?pTot[pi]-d:Infinity)>snap*3; };   // 一周する線は、終わりと始まりが隣どうし
+  // 1) 端点を、近くの線（の端点または途中）につなぐ
+  for(const v of ends){
+    const L=cell.get(cy(Y[v])*gw+cx(X[v])); if(!L) continue;
+    for(const s of L){
+      const a=segA[s],b=segB[s]; if(a===v||b===v) continue;
+      const dx=X[b]-X[a],dy=Y[b]-Y[a],LL=dx*dx+dy*dy;
+      const t=Math.max(0,Math.min(1,((X[v]-X[a])*dx+(Y[v]-Y[a])*dy)/LL));
+      if(Math.hypot(X[a]+t*dx-X[v],Y[a]+t*dy-Y[v])>snap||!farOnSame(v,s,t)) continue;
+      const Ls=Math.sqrt(LL);
+      const near=t*Ls<=snap?a:(1-t)*Ls<=snap?b:-1;
+      if(near<0){ addSplit(s,t,v); continue; }
+      uniteNear(near,v);
+    }
+  }
+  // 2) 線どうしの交点
+  for(const [k,L] of cell){
+    const ci=k%gw, cj=(k-ci)/gw;
+    for(let m=0;m<L.length;m++)for(let n=m+1;n<L.length;n++){
+      const s=L[m],r=L[n], a=segA[s],b=segB[s],c=segA[r],d=segB[r];
+      if(a===c||a===d||b===c||b===d) continue;
+      const ux=X[b]-X[a],uy=Y[b]-Y[a],vx=X[d]-X[c],vy=Y[d]-Y[c],den=ux*vy-uy*vx;
+      if(Math.abs(den)<1e-12) continue;
+      const wx=X[c]-X[a],wy=Y[c]-Y[a], t=(wx*vy-wy*vx)/den, u=(wx*uy-wy*ux)/den;
+      if(t<=1e-6||t>=1-1e-6||u<=1e-6||u>=1-1e-6) continue;
+      const px=X[a]+t*ux, py=Y[a]+t*uy;
+      if(cx(px)!==ci||cy(py)!==cj) continue;            // 同じ交点を2回数えない
+      if(segPath[s]===segPath[r]&&Math.abs(segArc[s]-segArc[r])<snap*3) continue;
+      const v=X.length; X.push(px); Y.push(py);
+      addSplit(s,t,v); addSplit(r,u,v);
+    }
+  }
+  // 3) 辺を作る（分割点で区切る。重なった辺も1本ずつ残す：減らすと奇数の点が増えて、かえってペン上げが増える）
+  const EA=[],EB=[],EP=[];
+  const addEdge=(a,b)=>{ a=find(a); b=find(b); if(a===b) return; EA.push(a); EB.push(b); EP.push(null); };
+  for(let s=0;s<nS;s++){
+    const L=splits.get(s); let prev=segA[s];
+    if(L){ L.sort((p,q)=>p[0]-q[0]); for(const [,v] of L){ addEdge(prev,v); prev=v; } }
+    addEdge(prev,segB[s]);
+  }
+  for(const p of tiny){   // 点・短い線は、その形のまま1本の辺にする
+    const a=X.length; X.push(p[0][0]); Y.push(p[0][1]); const b=X.length; X.push(p[p.length-1][0]); Y.push(p[p.length-1][1]);
+    EA.push(a); EB.push(b); EP.push(p);
+  }
+  const N=X.length, nE0=EA.length, KIND=new Array(nE0).fill(0);   // 0＝描く線、1＝なぞって移動、2＝ペンを上げて移動
+  const other=(e,v)=>EA[e]===v?EB[e]:EA[e];
+  const elen=e=>{ const P=EP[e]; return P?pathLen(P):Math.hypot(X[EA[e]]-X[EB[e]],Y[EA[e]]-Y[EB[e]]); };
+  const ptsOf=(e,from)=>{ const P=EP[e]; if(P) return from===EA[e]?P.slice(1):P.slice(0,-1).reverse(); const o=other(e,from); return [[X[o],Y[o]]]; };
+  const buildAdj=()=>{ const nE=EA.length, d=new Int32Array(N); for(let e=0;e<nE;e++){ d[EA[e]]++; d[EB[e]]++; }
+    const off=new Int32Array(N+1); for(let i=0;i<N;i++) off[i+1]=off[i]+d[i];
+    const adj=new Int32Array(off[N]), f=off.slice(0,N); for(let e=0;e<nE;e++){ adj[f[EA[e]]++]=e; adj[f[EB[e]]++]=e; } return {off,adj}; };
+  // つながり（連結成分）と、各点の線の本数（次数）
+  const cp=new Int32Array(N).map((_,i)=>i), cf=i=>{ while(cp[i]!==i){ cp[i]=cp[cp[i]]; i=cp[i]; } return i; };
+  const odd=new Uint8Array(N);
+  for(let e=0;e<nE0;e++){ odd[EA[e]]^=1; odd[EB[e]]^=1; const a=cf(EA[e]),b=cf(EB[e]); if(a!==b) cp[b]=a; }
+  // 一筆書きできないのは「線が奇数本集まる点」があるから。奇数の点を2つずつ結ぶと、1組ごとにペン上げが1回減る
+  // （ただし、つながりの中に奇数の点が2つしか残っていなければ、結んでも減らないので結ばない）
+  const oddCnt=new Int32Array(N); for(let v=0;v<N;v++) if(odd[v]) oddCnt[cf(v)]++;
+  const cand=[];
+  // A1) ペン幅以内に並んだ線の端どうしは、短い線でつなぐ（描き足すのはペン幅以下）
+  if(bridge>0){
+    const B=new Map(), bk=(i,j)=>i*1048576+j;
+    for(let v=0;v<N;v++) if(odd[v]){ const k=bk(Math.floor(X[v]/bridge),Math.floor(Y[v]/bridge)); let L=B.get(k); if(!L) B.set(k,L=[]); L.push(v); }
+    for(let v=0;v<N;v++){ if(!odd[v]) continue; const ci=Math.floor(X[v]/bridge), cj=Math.floor(Y[v]/bridge);
+      for(let dj=-1;dj<=1;dj++)for(let di=-1;di<=1;di++){ const L=B.get(bk(ci+di,cj+dj)); if(!L) continue;
+        for(const t of L){ if(t<=v) continue; const d=Math.hypot(X[t]-X[v],Y[t]-Y[v]); if(d<=bridge) cand.push({d,s:v,t,edges:null}); } } }
+  }
+  // A2) なぞり：奇数の点どうしを、描く線の上 retrace mm 以内で結べるなら、その道筋をもう1回通る
+  if(retrace>0){
+    const {off,adj}=buildAdj(), dist=new Float64Array(N), stamp=new Int32Array(N), from=new Int32Array(N);
+    const heap=[], hpush=(d,v)=>{ heap.push([d,v]); let i=heap.length-1; while(i>0){ const p=(i-1)>>1; if(heap[p][0]<=heap[i][0]) break; [heap[p],heap[i]]=[heap[i],heap[p]]; i=p; } };
+    const hpop=()=>{ const top=heap[0], last=heap.pop(); if(heap.length){ heap[0]=last; let i=0; for(;;){ const l=2*i+1,r=l+1; let m=i; if(l<heap.length&&heap[l][0]<heap[m][0]) m=l; if(r<heap.length&&heap[r][0]<heap[m][0]) m=r; if(m===i) break; [heap[m],heap[i]]=[heap[i],heap[m]]; i=m; } } return top; };
+    let iter=0;
+    for(let s=0;s<N;s++){ if(!odd[s]||oddCnt[cf(s)]<=2) continue;
+      iter++; heap.length=0; dist[s]=0; stamp[s]=iter; from[s]=-1; hpush(0,s); let found=0;
+      while(heap.length&&found<3){
+        const [d,v]=hpop(); if(d>dist[v]) continue;
+        if(v>s&&odd[v]){ const edges=[]; for(let u=v;from[u]>=0;u=other(from[u],u)) edges.push(from[u]); cand.push({d:d*1.5,s,t:v,edges}); found++; }   // なぞりは描く距離が増えるので、つなぐ線より後回し
+        for(let q=off[v];q<off[v+1];q++){ const e=adj[q]; if(EP[e]) continue;   // 点・短い線の上はたどらない
+          const o=other(e,v), nd=d+elen(e); if(nd>retrace) continue;
+          if(stamp[o]!==iter||nd<dist[o]){ stamp[o]=iter; dist[o]=nd; from[o]=e; hpush(nd,o); } }
+      }
+    }
+  }
+  cand.sort((a,b)=>a.d-b.d);
+  for(const c of cand){
+    if(!odd[c.s]||!odd[c.t]) continue;
+    const ra=cf(c.s), rb=cf(c.t);
+    if(ra===rb){ if(oddCnt[ra]<=2) continue; oddCnt[ra]-=2; }
+    else { cp[rb]=ra; oddCnt[ra]+=oddCnt[rb]-2; }
+    odd[c.s]=odd[c.t]=0;
+    if(c.edges) for(const e of c.edges){ EA.push(EA[e]); EB.push(EB[e]); EP.push(null); KIND.push(1); }
+    else { EA.push(c.s); EB.push(c.t); EP.push(null); KIND.push(0); }
+  }
+  // B) 残った奇数の点は、同じつながりの中で近いものどうしを「ペンを上げて移動する辺」で結ぶ
+  const byComp=new Map();
+  for(let v=0;v<N;v++) if(odd[v]){ const c=cf(v); let L=byComp.get(c); if(!L) byComp.set(c,L=[]); L.push(v); }
+  for(const L of byComp.values()){
+    L.sort((a,b)=>X[a]-X[b]||Y[a]-Y[b]); const taken=new Uint8Array(L.length);
+    for(let i=0;i<L.length;i++){ if(taken[i]) continue; taken[i]=1; const u=L[i]; let bj=-1,bd=Infinity;
+      for(let j=i+1;j<L.length;j++){ if(taken[j]) continue; const d=(X[L[j]]-X[u])**2+(Y[L[j]]-Y[u])**2; if(d<bd){ bd=d; bj=j; } }
+      if(bj<0) break; taken[bj]=1; EA.push(u); EB.push(L[bj]); EP.push(null); KIND.push(2); }
+  }
+  // C) これで全部の点が偶数になったので、つながりごとに一筆書き（ヒールホルツァー法）。
+  //    分かれ道では、なるべく曲がらない向きへ進む。ペンを上げる辺の所で区切る
+  const {off,adj}=buildAdj(), nE=EA.length, used=new Uint8Array(nE), runs=[];
+  const lastDir=(e,from)=>{ const P=ptsOf(e,from), z=P[P.length-1], y=P.length>1?P[P.length-2]:[X[from],Y[from]], l=Math.hypot(z[0]-y[0],z[1]-y[1])||1; return [(z[0]-y[0])/l,(z[1]-y[1])/l]; };
+  for(let v0=0;v0<N;v0++){
+    let has=false; for(let q=off[v0];q<off[v0+1];q++) if(!used[adj[q]]){ has=true; break; }
+    if(!has) continue;
+    const sv=[v0], se=[-1], sd=[[0,0]], circ=[];
+    while(sv.length){
+      const v=sv[sv.length-1], [dx,dy]=sd[sd.length-1]; let be=-1, bc=-Infinity;
+      for(let q=off[v];q<off[v+1];q++){ const e=adj[q]; if(used[e]) continue;
+        let c;
+        if(KIND[e]===2) c=-10;   // ペン上げの辺は最後に回す
+        else { const P=ptsOf(e,v), nx=P[0][0]-X[v], ny=P[0][1]-Y[v], l=Math.hypot(nx,ny)||1; c=(dx||dy)?(nx*dx+ny*dy)/l:0; }
+        if(c>bc){ bc=c; be=e; } }
+      if(be>=0){ used[be]=1; sv.push(other(be,v)); se.push(be); sd.push(KIND[be]===2?[0,0]:lastDir(be,v)); }
+      else { circ.push([v,se[se.length-1]]); sv.pop(); se.pop(); sd.pop(); }
+    }
+    // circ は一筆書きの逆順。i 番目の点から i+1 番目の点へ、circ[i][1] の辺で進む
+    const part=[]; let cur=[[X[circ[0][0]],Y[circ[0][0]]]], cut=false;
+    for(let i=0;i+1<circ.length;i++){
+      const [u,e]=circ[i], w=circ[i+1][0];
+      if(KIND[e]===2){ part.push(cur); cur=[[X[w],Y[w]]]; cut=true; continue; }
+      for(const p of ptsOf(e,u)) cur.push(p);
+    }
+    if(cut&&part.length){ part[0]=cur.concat(part[0].slice(1)); } else part.push(cur);   // 一周しているので、最後と最初をつなぐ
+    for(const r of part) if(r.length>1) runs.push(r);
+  }
+  // D) 書き始めの位置が近い順に並べる（逆向き・一周する線は途中から描き始めてもよい）
+  const n=runs.length, done=new Uint8Array(n), out=[];
+  const closed=runs.map(r=>Math.hypot(r[0][0]-r[r.length-1][0],r[0][1]-r[r.length-1][1])<=0.05);
+  const box=runs.map(r=>{ let a=Infinity,b=Infinity,c=-Infinity,d=-Infinity; for(const [x,y] of r){ if(x<a)a=x; if(y<b)b=y; if(x>c)c=x; if(y>d)d=y; } return [a,b,c,d]; });
+  let px=0,py=0;
+  for(let k=0;k<n;k++){
+    let best=-1,bd=Infinity,mode=0,at=0;
+    for(let i=0;i<n;i++){ if(done[i]) continue; const r=runs[i];
+      const da=(r[0][0]-px)**2+(r[0][1]-py)**2, db=(r[r.length-1][0]-px)**2+(r[r.length-1][1]-py)**2;
+      if(da<bd){ bd=da; best=i; mode=0; } if(db<bd){ bd=db; best=i; mode=1; }
+      if(closed[i]){ const B=box[i], lx=Math.max(B[0]-px,0,px-B[2]), ly=Math.max(B[1]-py,0,py-B[3]);
+        if(lx*lx+ly*ly<bd) for(let j=1;j<r.length-1;j++){ const d=(r[j][0]-px)**2+(r[j][1]-py)**2; if(d<bd){ bd=d; best=i; mode=2; at=j; } } }
+    }
+    if(best<0) throw new Error('route: no start');
+    done[best]=1; let r=runs[best];
+    if(mode===1) r=r.slice().reverse(); else if(mode===2) r=r.slice(at).concat(r.slice(1,at+1));
+    out.push(r); px=r[r.length-1][0]; py=r[r.length-1][1];
+  }
+  return out;
+}
+// 描き順の設定に従って並べ替える
+function routeFor(P){
+  const m=$('routeMode').value;
+  if(m==='near'||P.length<2) return P;
+  const pen=+$('penW').value||0.4;
+  // 万一うまく計算できなかったときは、従来の並べ方で描く（描画内容は変わらない）
+  try{ return routePaths(P,Math.max(0.05,pen*0.5),m==='retrace'?Math.max(0,+$('retraceMax').value||0):0,pen); }
+  catch(e){ console.warn('描き順の計算に失敗したので、標準の描き順にします',e); return P; }
+}
+// ペンを上げる回数（次の線が今の線の終わりから始まるときは数えない）
+function penLifts(P){
+  let n=0; for(let k=0;k<P.length;k++){ const a=k&&P[k-1][P[k-1].length-1], b=P[k][0]; if(!k||Math.hypot(a[0]-b[0],a[1]-b[1])>0.05) n++; }
+  return n;
+}
+
 /* ========== QR コード生成（JIS X 0510 / ISO 18004、バイトモード、外部ライブラリなし） ========== */
 const QR=(()=>{
   // 版(1〜40)ごとの 1ブロックあたりの誤り訂正コード語数 / ブロック数
@@ -1629,7 +1856,7 @@ function compose(){
     }
   }
   const nSt=raw?0:layers.filter(l=>l.visible&&l.key.startsWith('stamp:')).length; if(nSt) parts.push(`アイコン・文字×${nSt}`);
-  finalPaths=P;
+  finalPaths=(raw||layoutFast)?P:routeFor(P);
   lab.textContent='描画内容：'+(parts.length?parts.join(' + '):'なし'); lab.classList.toggle('empty',!parts.length);
   draw(); updateStats();
   if(!layoutFast) renderLayers();
@@ -1945,10 +2172,17 @@ function updateStats(){
   let draw=0,travel=0,px=0,py=0;
   for(const p of finalPaths){travel+=Math.hypot(p[0][0]-px,p[0][1]-py);draw+=pathLen(p);px=p[p.length-1][0];py=p[p.length-1][1];}
   const fd=+$('feedDraw').value,ft=+$('feedTravel').value,dl=+$('penDelay').value;
-  const sec=draw/fd*60+travel/ft*60+finalPaths.length*dl*2;
-  $('stats').innerHTML=`線の数 <b>${finalPaths.length}</b>　描画距離 <b>${(draw/1000).toFixed(2)} m</b>　移動距離 <b>${(travel/1000).toFixed(2)} m</b>　推定時間 <b>${Math.floor(sec/60)}分${Math.round(sec%60)}秒</b>${imported?'':`　処理 <b>${$('stats').dataset.ms||'-'}ms</b>`}`;
+  const lifts=penLifts(finalPaths), sec=draw/fd*60+travel/ft*60+lifts*dl*2;
+  $('stats').innerHTML=`ペン上げ <b>${lifts}</b> 回　描画距離 <b>${(draw/1000).toFixed(2)} m</b>　移動距離 <b>${(travel/1000).toFixed(2)} m</b>　推定時間 <b>${Math.floor(sec/60)}分${Math.round(sec%60)}秒</b>${imported?'':`　処理 <b>${$('stats').dataset.ms||'-'}ms</b>`}`;
 }
 ['feedDraw','feedTravel','penDelay'].forEach(id=>$(id).addEventListener('change',updateStats));
+const ROUTE_NOTE={near:'エレメントごとに、近い線から順に描きます（従来の描き方）。',
+  join:'つながっている線・交差している線は、ペンを下ろしたまま一筆書きで続けて描きます。線の端どうしがペン先の太さより近いときは、短い線でつなぎます。同じ線を2回なぞることはありません。',
+  retrace:'一筆書き優先に加えて、行き止まりでは描いた線の上を（上限の長さまで）なぞって次の線へ移ります。ペンの上げ下げが最も少なくなります。同じ所を2回なぞるので、にじみやすいペンでは線が少し濃くなることがあります。'};
+function syncRouteUI(){ const m=$('routeMode').value; $('retraceFld').style.display=m==='retrace'?'':'none'; $('routeNote').textContent=ROUTE_NOTE[m]+' 描き順は全エレメントをまとめて決めます。G-code ファイルを「ファイルのまま送信」するときは使いません。'; }
+$('routeMode').addEventListener('change',()=>{ syncRouteUI(); compose(); });
+$('retraceMax').addEventListener('change',compose);
+syncRouteUI();
 
 /* ========== 出力 ========== */
 /* ---------- 紙の座標 ⇔ 機械の座標（出力の向き＝縦横変換を含む） ----------
@@ -3360,7 +3594,7 @@ function loadDroppedFile(f){
 
 /* ========== 設定プロファイル（用紙・ペン・速度・G-code） ========== */
 // このブラウザの localStorage に保存する（端末の外には出ない）。JSON ファイルで書き出し・読み込みもできる
-const PROFILE_IDS=['paper','orient','pw','ph','margin','origin','strokeX','strokeY','outRot','flipY','penMode','penUp','penDown','penDelay','penW','feedDraw','feedTravel','travelCmd','header','footer','baud'];
+const PROFILE_IDS=['routeMode','retraceMax','paper','orient','pw','ph','margin','origin','strokeX','strokeY','outRot','flipY','penMode','penUp','penDown','penDelay','penW','feedDraw','feedTravel','travelCmd','header','footer','baud'];
 const PKEY='plotterProfiles', PLAST='plotterProfileLast';
 function getProfiles(){ try{ const p=JSON.parse(localStorage.getItem(PKEY)||'{}'); return p&&typeof p==='object'?p:{}; }catch(e){ return {}; } }
 function setProfiles(p){
@@ -3371,7 +3605,7 @@ function profMsg(t){ $('profNote').textContent=t; }
 function currentSettings(){ const o={}; PROFILE_IDS.forEach(id=>{ const e=$(id); o[id]=e.type==='checkbox'?e.checked:e.value; }); return o; }
 function applySettings(o){
   PROFILE_IDS.forEach(id=>{ if(!(id in o)) return; const e=$(id); if(e.type==='checkbox') e.checked=!!o[id]; else e.value=String(o[id]); });
-  syncPen(); syncOrientUI(); rotCache=null; savePrefs(); schedule(); updateStats();
+  syncPen(); syncOrientUI(); syncRouteUI(); rotCache=null; savePrefs(); schedule(); compose();
 }
 function sameSettings(a,b){ return PROFILE_IDS.every(id=>String(a[id])===String(b[id])); }
 function refreshProfiles(select){
