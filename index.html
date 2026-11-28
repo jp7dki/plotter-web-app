@@ -2905,7 +2905,7 @@ function buildTextGeom(text,fontCss,bold){
   const hpx=y1-y0+1, toU=([px,py])=>[(px-2)/hpx,(py-2)/hpx];
   const tidy=(paths,minLen,close)=>paths.filter(p=>pathLen(p)>=minLen).map(p=>{
     if(close&&p.length>3&&Math.hypot(p[0][0]-p[p.length-1][0],p[0][1]-p[p.length-1][1])<=2.5) p=p.concat([p[0]]);
-    return chaikin(rdp(p,0.7),1).map(toU);
+    return chaikin(close?rdp(p,0.7):despike(rdp(p,0.7),3.5),1).map(toU);
   });
   // 一筆書き風：文字を細線化して中心線をたどる
   const center=tidy(chainSkeleton(traceEdges(thin(ink,cw,ch),cw,ch),hpx),3,false);
@@ -2946,6 +2946,25 @@ function marchingSquares(img,w,h){
     out.push(line.map(([x2,y2])=>[x2/2,y2/2]));
   }
   return out;
+}
+// 細線化の中心線に残る、ごく小さな「行って戻る」折り返し（ひげ・ギザギザ）を取り除く。
+// ペンがその場で細かく往復して、塗りつぶすような動きになるのを防ぐ。
+// 折り返しの点（120°以上向きを変える点）が、前後の点を結ぶ線から tol 以内なら消す。本当の角は前後の線が長いので残る
+function despike(p,tol){
+  if(p.length<3) return p;
+  let q=p.slice(), changed=true;
+  while(changed&&q.length>2){
+    changed=false;
+    for(let i=1;i<q.length-1;i++){
+      const a=q[i-1], b=q[i], c=q[i+1], ax=b[0]-a[0], ay=b[1]-a[1], bx=c[0]-b[0], by=c[1]-b[1];
+      const la=Math.hypot(ax,ay), lb=Math.hypot(bx,by);
+      if(la<1e-9||lb<1e-9){ q.splice(i,1); changed=true; i--; continue; }   // 同じ点の重なり
+      if((ax*bx+ay*by)/(la*lb)>-0.5) continue;
+      const dx=c[0]-a[0], dy=c[1]-a[1], L=dx*dx+dy*dy, t=L?Math.max(0,Math.min(1,((b[0]-a[0])*dx+(b[1]-a[1])*dy)/L)):0;
+      if(Math.hypot(a[0]+t*dx-b[0],a[1]+t*dy-b[1])<=tol){ q.splice(i,1); changed=true; i--; }
+    }
+  }
+  return q;
 }
 // 文字の画像のうち、中心線が通っていない独立した印（点・短い棒）を、ペンで描ける短い線にする。座標は画素
 function smallMarks(ink,w,h,center,hpx){
@@ -3097,6 +3116,8 @@ function textStampGeom(st){
   // 一筆書き風：ペン幅より近い切れ目は、ペンを上げずにつなぐ（つなぎ目はペンの太さに隠れる）
   if(st.tstyle==='center'){
     paths=joinPaths(orderPaths(paths),(+$('penW').value||0.4)*0.75);
+    // つなぎ目で少し戻る小さな折り返しも取り除く（ペン幅より小さいので、消しても見た目は変わらない）
+    paths=paths.map(p=>despike(p,(+$('penW').value||0.4)*0.75));
     // i や ! の点：ペンより大きければ、うず巻きで塗って元の点の大きさにする
     const pen=+$('penW').value||0.4;
     for(const d of g.dots||[]){
